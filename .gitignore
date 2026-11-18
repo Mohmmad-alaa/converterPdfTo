@@ -1,0 +1,16 @@
+# بايثون
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# مخرجات مؤقتة وقت التشغيل
+work/
+out/
+.chrome/
+*.log
+
+# ملفات شخصية / نتائج اختبار المستخدم — لا تُرفع
+samples/823-*
+samples/preview*
