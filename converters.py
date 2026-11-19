@@ -589,7 +589,10 @@ def _page_size_pt(src: Path) -> tuple[float, float]:
 
 
 def ocr_pdf_to_docx(src: Path, dst: Path, dpi: int = 200, fidelity: bool = True) -> dict:
-    width_pt, height_pt = _page_size_pt(src)
+    if fidelity:
+        width_pt, height_pt = _page_size_pt(src)
+    else:
+        width_pt, height_pt = 595.0, 842.0  # A4 للتنسيق البسيط
     pages = ocr_engine.ocr_pdf(src, dpi=dpi)
     doc = _new_ocr_document(width_pt, height_pt)
     pt_per_px = 72.0 / dpi
