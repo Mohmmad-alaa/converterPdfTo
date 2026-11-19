@@ -140,7 +140,10 @@ def _group_positions(values: list[int], tolerance: int = 8) -> list[int]:
 
 
 def detect_grid_lines(img: Image.Image) -> tuple[list[int], list[int]]:
-    """يستخرج مواضع خطوط الجدول (أفقية ورأسية) من الصورة عبر OpenCV."""
+    """
+    يستخرج مواضع خطوط الجدول (أفقية ورأسية) من الصورة عبر OpenCV.
+    يعيد المحاولة بعتبات أخفض للصفحات الباهتة أو المائلة قليلًا.
+    """
     try:
         import cv2
         import numpy as np
@@ -165,9 +168,23 @@ def detect_grid_lines(img: Image.Image) -> tuple[list[int], list[int]]:
         )
         h_proj = (horizontal > 0).sum(axis=1)
         v_proj = (vertical > 0).sum(axis=0)
-        ys = _group_positions([i for i, c in enumerate(h_proj) if c > width * 0.15])
-        xs = _group_positions([i for i, c in enumerate(v_proj) if c > height * 0.15])
-        return xs, ys
+
+        candidates: list[tuple[list[int], list[int]]] = []
+        for threshold in (0.15, 0.08, 0.06):
+            ys = _group_positions([i for i, c in enumerate(h_proj) if c > width * threshold])
+            xs = _group_positions([i for i, c in enumerate(v_proj) if c > height * threshold])
+            candidates.append((xs, ys))
+            # شبكة مكتملة: أعمدة وصفوف كافية — لا حاجة لمحاولة أخفض
+            if len(xs) >= 8 and len(ys) >= 20:
+                return xs, ys
+
+        def score(item: tuple[list[int], list[int]]) -> int:
+            xs_i, ys_i = item
+            if len(xs_i) > 25 or len(ys_i) > 90:  # ضجيج
+                return -1
+            return len(xs_i) + len(ys_i)
+
+        return max(candidates, key=score)
     except Exception:
         return [], []
 
@@ -288,6 +305,11 @@ def similarity(a: str, b: str) -> float:
 class Grid:
     rows: list[list[str]] = field(default_factory=list)
     n_cols: int = 0
+    # قياسات هندسية بالبكسل (بنفس ترتيب الأعمدة/الصفوف) لبناء تنسيق مطابق للأصل
+    col_bounds: list[tuple[float, float]] = field(default_factory=list)
+    row_bounds: list[tuple[float, float]] = field(default_factory=list)
+    cell_heights: list[list[float]] = field(default_factory=list)
+    header_rows: int = 1
 
     @property
     def header(self) -> list[str]:
@@ -298,8 +320,12 @@ class Grid:
 class PageLayout:
     paragraphs: list[str] = field(default_factory=list)
     grid: Grid | None = None
-    before: list[str] = field(default_factory=list)
-    after: list[str] = field(default_factory=list)
+    before: list[tuple[str, str]] = field(default_factory=list)
+    after: list[tuple[str, str]] = field(default_factory=list)
+    text_height: float = 0.0
+    page_width: float = 0.0
+    page_height: float = 0.0
+    gap_before: float = 0.0
 
 
 def _median(values: list[float]) -> float:
@@ -407,8 +433,10 @@ def _join_words(words: list[Word]) -> str:
     return " ".join(out)
 
 
-def _words_to_paragraphs(words: list[Word], line_height: float) -> list[str]:
-    """يعيد بناء أسطر النص الحر من كلمات خارج الجدول."""
+def _words_to_paragraphs(
+    words: list[Word], line_height: float, page_width: float
+) -> list[tuple[str, str]]:
+    """يعيد بناء أسطر النص الحر مع محاذاتها (وسط أو يمين)."""
     if not words:
         return []
     ordered = sorted(words, key=lambda w: w.cy)
@@ -418,12 +446,35 @@ def _words_to_paragraphs(words: list[Word], line_height: float) -> list[str]:
             groups[-1].append(w)
         else:
             groups.append([w])
-    lines = [_join_words(group) for group in groups]
-    return [
-        line
-        for line in lines
-        if line.strip() and not (len(line.strip()) <= 2 and not any(c.isdigit() for c in line))
-    ]
+
+    out: list[tuple[str, str]] = []
+    for group in groups:
+        # قد يحتوي السطر على كتل منفصلة (يمين ووسط ويسار) — نفصلها بفراغ كبير
+        by_x = sorted(group, key=lambda w: w.cx)
+        segments: list[list[Word]] = [[by_x[0]]]
+        for w in by_x[1:]:
+            if w.x0 - segments[-1][-1].x1 > page_width * 0.05:
+                segments.append([w])
+            else:
+                segments[-1].append(w)
+
+        for segment in reversed(segments):  # من اليمين إلى اليسار
+            text = _join_words(segment)
+            if not text.strip():
+                continue
+            if len(text.strip()) <= 2 and not any(c.isdigit() for c in text):
+                continue
+            x0 = min(w.x0 for w in segment)
+            x1 = max(w.x1 for w in segment)
+            center = (x0 + x1) / 2
+            if abs(center - page_width / 2) < page_width * 0.08:
+                align = "center"
+            elif center > page_width / 2:
+                align = "right"
+            else:
+                align = "left"
+            out.append((text, align))
+    return out
 
 
 def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
@@ -460,29 +511,49 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
     def cell_text(items: list[Word]) -> str:
         return _join_words(items).strip()
 
-    # حذف الأعمدة الفارغة (خطوط مزدوجة أو هوامش داخلية)
+    # حذف الأعمدة الوهمية فقط: خطوط مزدوجة رقيقة أو رموز عابرة.
+    # الأعمدة الفارغة الحقيقية تبقى حتى يطابق الجدول أبعاد الأصل.
     keep = []
     n_rows = len(row_bands)
     for c in col_order:
+        left_x, right_x = col_bands[c]
+        if right_x - left_x < 25:
+            continue
         cells = [cell_text(matrix.get((r, c), [])) for r in range(n_rows)]
         filled = [text for text in cells if text]
-        if len(filled) < max(2, int(n_rows * 0.08)):
-            continue
-        # عمود شبه فارغ يحتوي رموزًا فقط = خط مزدوج أو علامة عابرة
-        if len(filled) < n_rows * 0.2 and max(len(text) for text in filled) <= 2:
+        if filled and len(filled) < n_rows * 0.2 and max(len(text) for text in filled) <= 2:
             continue
         keep.append(c)
     if len(keep) < 2:
         return None
 
+    # الأعمدة الفارغة تمامًا (خطوط عابرة أو فراغ داخل خلية) تُحذف
+    def _has_data(column: int) -> bool:
+        return any(cell_text(matrix.get((r, column), [])) for r in range(n_rows))
+
+    keep = [c for c in keep if _has_data(c)]
+    if len(keep) < 2:
+        return None
+
     rows: list[list[str]] = []
+    row_heights: list[list[float]] = []
+    row_indices: list[int] = []
     for r in range(len(row_bands)):
         cells = [cell_text(matrix.get((r, c), [])) for c in keep]
         if any(cells):
             rows.append(cells)
+            row_indices.append(r)
+            row_heights.append(
+                [
+                    _median([w.height for w in matrix.get((r, c), [])]) or 0.0
+                    for c in keep
+                ]
+            )
     if len(rows) < 3:
         return None
 
+    header_rows = 1
+    merged_header = False
     # دمج صفّي الترويسة إن كانا متكاملين (مثل: "رقم" + "القطعة")
     if len(rows) >= 2:
         first, second = rows[0], rows[1]
@@ -508,12 +579,39 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                     merged.append("")
             if complementary:
                 rows = [merged] + rows[2:]
+                row_heights = [
+                    [max(h1, h2) for h1, h2 in zip(row_heights[0], row_heights[1])]
+                ] + row_heights[2:]
+                row_indices = [row_indices[0]] + row_indices[2:]
+                merged_header = True
+
+    # حدود الصفوف بالبكسل (بنفس ترتيب rows)
+    row_bounds: list[tuple[float, float]] = []
+    for i, r in enumerate(row_indices):
+        top_y, bottom_y = row_bands[r]
+        if i == 0 and merged_header:
+            bottom_y = row_bands[r + 1][1]
+        row_bounds.append((top_y, bottom_y))
 
     layout = PageLayout()
-    layout.grid = Grid(rows=rows, n_cols=len(keep))
+    layout.page_width = float(page.width)
+    layout.page_height = float(page.height)
+    layout.grid = Grid(
+        rows=rows,
+        n_cols=len(keep),
+        col_bounds=[col_bands[c] for c in keep],
+        row_bounds=row_bounds,
+        cell_heights=row_heights,
+        header_rows=header_rows,
+    )
     line_height = _median([w.height for w in words]) or 20
-    layout.before = _words_to_paragraphs([w for w in outside if w.cy < top], line_height)
-    layout.after = _words_to_paragraphs([w for w in outside if w.cy > bottom], line_height)
+    above = [w for w in outside if w.cy < top]
+    layout.text_height = _median([w.height for w in outside]) or line_height
+    layout.gap_before = max(0.0, top - max((w.y1 for w in above), default=top))
+    layout.before = _words_to_paragraphs(above, line_height, float(page.width))
+    layout.after = _words_to_paragraphs(
+        [w for w in outside if w.cy > bottom], line_height, float(page.width)
+    )
     return layout
 
 
@@ -623,18 +721,25 @@ def _analyze_with_projection(page: OcrPage) -> PageLayout:
     table_top = rows[best_start][0]
     table_bottom = rows[best_start + best_len - 1][0]
     extras_before = [
-        " ".join(c for c in cells if c)
+        (" ".join(c for c in cells if c), "right")
         for y, cells in rows[:best_start]
         if y < table_top
     ]
     extras_after = [
-        " ".join(c for c in cells if c)
+        (" ".join(c for c in cells if c), "right")
         for y, cells in rows[best_start + best_len :]
         if y > table_bottom
     ]
 
-    layout.before = [ln.text for ln in flow_lines if ln.y1 <= table_top and ln.text.strip()]
+    layout.page_width = float(page.width)
+    layout.page_height = float(page.height)
+    layout.text_height = line_height
+    layout.before = [
+        (ln.text, "right") for ln in flow_lines if ln.y1 <= table_top and ln.text.strip()
+    ]
     layout.before.extend(extras_before)
-    layout.after = [ln.text for ln in flow_lines if ln.y0 >= table_bottom and ln.text.strip()]
+    layout.after = [
+        (ln.text, "right") for ln in flow_lines if ln.y0 >= table_bottom and ln.text.strip()
+    ]
     layout.after.extend(extras_after)
     return layout

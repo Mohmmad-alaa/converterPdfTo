@@ -14,3 +14,4 @@ out/
 # ملفات شخصية / نتائج اختبار المستخدم — لا تُرفع
 samples/823-*
 samples/preview*
+samples/compare_*

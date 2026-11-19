@@ -21,7 +21,7 @@ from typing import Iterable, Sequence
 import pdfplumber
 from PIL import Image as PILImage
 from docx import Document
-from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.table import WD_ALIGN_VERTICAL, WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -390,52 +390,172 @@ def _rtl_run(run, size: float, bold: bool = False, gray: bool = False) -> None:
         _insert_ordered(rPr, OxmlElement("w:rtl"), _AFTER_RTL)
 
 
-def _add_arabic_paragraph(doc, text: str, size: float = 11, bold: bool = False, gray: bool = False):
+def _add_arabic_paragraph(
+    doc, text: str, size: float = 11, bold: bool = False, gray: bool = False, align: str | None = None
+):
     paragraph = doc.add_paragraph()
     _rtl_paragraph(paragraph)
+    if align == "center":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif align == "left":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(0.5)
+    paragraph.paragraph_format.line_spacing = 0.92
     run = paragraph.add_run(text)
     _rtl_run(run, size, bold=bold, gray=gray)
     return paragraph
 
 
-def _add_ocr_table(doc, rows: list[list[str]], n_cols: int, header: bool = True) -> None:
-    table = doc.add_table(rows=0, cols=n_cols)
+def _set_cell_margins(table, top: int = 15, bottom: int = 15, left: int = 50, right: int = 50) -> None:
+    margins = OxmlElement("w:tblCellMar")
+    for tag, value in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
+        node = OxmlElement(f"w:{tag}")
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+        margins.append(node)
+    _insert_ordered(
+        table._tbl.tblPr, margins, ("w:tblLook", "w:tblCaption", "w:tblDescription")
+    )
+
+
+def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity: bool = True) -> None:
+    """
+    يبني جدول Word بقياسات الصفحة الأصلية:
+    عرض كل عمود وارتفاع كل صف وحجم خط الخلية مأخوذة من الصورة نفسها.
+    """
+    rows = grid.rows
+    n_cols = grid.n_cols
+    table = doc.add_table(rows=len(rows), cols=n_cols)
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = True
-    _insert_ordered(table._tbl.tblPr, OxmlElement("w:bidiVisual"), ("w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"))
+    table.autofit = False
+    _insert_ordered(
+        table._tbl.tblPr,
+        OxmlElement("w:bidiVisual"),
+        ("w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout",
+         "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
+    )
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    _insert_ordered(
+        table._tbl.tblPr, layout, ("w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription")
+    )
+    _set_cell_margins(table)
 
-    for index, row_cells in enumerate(rows):
-        cells = table.add_row().cells
-        for col in range(n_cols):
-            cell = cells[col]
-            text = row_cells[col] if col < len(row_cells) else ""
+    # عرض الأعمدة من حدود الجدول الأصلية، مع تقليص متناسب إن تجاوز عرض الصفحة
+    scale = 1.0
+    widths: list[float] | None = None
+    if fidelity and len(grid.col_bounds) == n_cols:
+        raw = [max(10.0, (b[1] - b[0]) * pt_per_px) for b in grid.col_bounds]
+        total = sum(raw)
+        if total > 0 and usable_width_pt > 0:
+            # نملأ عرض الصفحة كما في الأصل، بسقف يمنع التمدد المبالغ
+            scale = min(1.35, usable_width_pt / total)
+        widths = [w * scale for w in raw]
+        for index, width in enumerate(widths):
+            table.columns[index].width = Pt(width)
+
+    header_rows = grid.header_rows if fidelity else 1
+
+    for r, cells_text in enumerate(rows):
+        row = table.rows[r]
+        if fidelity and r < len(grid.row_bounds):
+            # ارتفاع الصف من خطوط الجدول الأصلية — لا يُقاس بمعامل العرض
+            height = (grid.row_bounds[r][1] - grid.row_bounds[r][0]) * pt_per_px
+            row.height = Pt(max(12.0, height))
+            row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+        if r < header_rows:
+            row._tr.get_or_add_trPr().append(OxmlElement("w:tblHeader"))
+
+        for c in range(n_cols):
+            cell = row.cells[c]
+            text = cells_text[c] if c < len(cells_text) else ""
+            if widths:
+                cell.width = Pt(widths[c])
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             paragraph = cell.paragraphs[0]
             _rtl_paragraph(paragraph)
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1.0
+
+            size = 8.5
+            if fidelity and r < len(grid.cell_heights):
+                heights = grid.cell_heights[r]
+                if c < len(heights) and heights[c]:
+                    size = max(6.5, min(13.0, heights[c] * pt_per_px * 0.88))
+
+            if r < header_rows or (text and _is_numeric(text)):
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = paragraph.add_run(text)
-            _rtl_run(run, 8.5, bold=header and index == 0)
+            _rtl_run(run, size, bold=r < header_rows)
 
 
-def _emit_layout(doc, layout, first: bool = False, label: str | None = None) -> None:
-    if not first:
-        doc.add_page_break()
-    if label:
-        _page_label_text(doc, label)
-    for text in layout.before:
-        _add_arabic_paragraph(doc, text, size=11)
+def _is_numeric(text: str) -> bool:
+    allowed = set("0123456789٠١٢٣٤٥٦٧٨٩.,،/- ")
+    return bool(text) and all(ch in allowed for ch in text)
+
+
+def _emit_layout(
+    doc,
+    layout,
+    pt_per_px: float,
+    usable_width_pt: float,
+    first: bool = False,
+    label: str | None = None,
+    fidelity: bool = True,
+) -> None:
+    anchor = _page_label_text(doc, label) if label else None
+
+    body_size = 11.0
+    if fidelity and layout.text_height:
+        body_size = max(7.5, min(16.0, layout.text_height * pt_per_px * 0.86))
+
+    for text, align in layout.before:
+        paragraph = _add_arabic_paragraph(doc, text, size=body_size, align=align)
+        if anchor is None:
+            anchor = paragraph
+
+    # إعادة الفراغ الرأسي الذي كان يفصل النص عن الجدول في الأصل
+    if fidelity and layout.gap_before > 0:
+        spacer = doc.add_paragraph()
+        spacer.paragraph_format.space_before = Pt(0)
+        spacer.paragraph_format.space_after = Pt(0)
+        spacer.paragraph_format.line_spacing = Pt(min(150.0, max(4.0, layout.gap_before * pt_per_px)))
+        spacer.add_run("").font.size = Pt(1)
+
     if layout.grid and layout.grid.rows:
-        _add_ocr_table(doc, layout.grid.rows, layout.grid.n_cols)
-    for text in layout.after:
-        _add_arabic_paragraph(doc, text, size=10, gray=True)
+        if anchor is None:
+            anchor = doc.add_paragraph()
+            anchor.paragraph_format.space_after = Pt(0)
+            anchor.add_run("").font.size = Pt(1)
+        _add_ocr_table(doc, layout.grid, pt_per_px, usable_width_pt, fidelity=fidelity)
+    for text, align in layout.after:
+        _add_arabic_paragraph(
+            doc, text, size=max(7.0, body_size - 1.5), gray=True, align=align
+        )
+
+    if not first and anchor is not None:
+        anchor.paragraph_format.page_break_before = True
 
 
-def _new_ocr_document() -> Document:
+MARGIN_PT = 18.0
+
+
+def _new_ocr_document(
+    width_pt: float | None = None, height_pt: float | None = None, margin_pt: float = MARGIN_PT
+) -> Document:
     doc = Document()
     section = doc.sections[0]
-    section.top_margin = Cm(1.4)
-    section.bottom_margin = Cm(1.4)
-    section.left_margin = Cm(1.4)
-    section.right_margin = Cm(1.4)
+    if width_pt and height_pt:
+        section.page_width = Pt(width_pt)
+        section.page_height = Pt(height_pt)
+    margin = Pt(margin_pt)
+    section.top_margin = margin
+    section.bottom_margin = margin
+    section.left_margin = margin
+    section.right_margin = margin
     # اتجاه المقطع من اليمين إلى اليسار
     sectPr = section._sectPr
     if sectPr.find(qn("w:bidi")) is None:
@@ -446,24 +566,42 @@ def _new_ocr_document() -> Document:
     return doc
 
 
-def _page_label_text(doc, label: str) -> None:
+def _page_label_text(doc, label: str):
     paragraph = doc.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    paragraph.paragraph_format.space_after = Pt(4)
     run = paragraph.add_run(label)
     run.font.size = Pt(8)
     run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
     run.font.name = ARABIC_FONT
+    return paragraph
 
 
-def ocr_pdf_to_docx(src: Path, dst: Path, dpi: int = 200) -> dict:
+def _page_size_pt(src: Path) -> tuple[float, float]:
+    import pymupdf
+
+    doc = pymupdf.open(str(src))
+    try:
+        rect = doc.load_page(0).rect
+        return float(rect.width), float(rect.height)
+    finally:
+        doc.close()
+
+
+def ocr_pdf_to_docx(src: Path, dst: Path, dpi: int = 200, fidelity: bool = True) -> dict:
+    width_pt, height_pt = _page_size_pt(src)
     pages = ocr_engine.ocr_pdf(src, dpi=dpi)
-    doc = _new_ocr_document()
+    doc = _new_ocr_document(width_pt, height_pt)
+    pt_per_px = 72.0 / dpi
+    usable = width_pt - 2 * MARGIN_PT
     for index, page in enumerate(pages, start=1):
         layout = ocr_engine.analyze_page(page)
         label = f"— صفحة {index} من {len(pages)} —" if len(pages) > 1 else None
-        _emit_layout(doc, layout, first=index == 1, label=label)
+        _emit_layout(
+            doc, layout, pt_per_px, usable, first=index == 1, label=label, fidelity=fidelity
+        )
     doc.save(str(dst))
-    return {"pages": len(pages), "ocr": True}
+    return {"pages": len(pages), "ocr": True, "fidelity": fidelity}
 
 
 def ocr_pdf_to_xlsx(src: Path, dst: Path, dpi: int = 200) -> dict:
@@ -478,7 +616,7 @@ def ocr_pdf_to_xlsx(src: Path, dst: Path, dpi: int = 200) -> dict:
         ws = wb.create_sheet(_safe_sheet_name(f"صفحة {index}", used))
         ws.sheet_view.rightToLeft = True
         row_cursor = 1
-        for text in layout.before:
+        for text, _align in layout.before:
             ws.cell(row=row_cursor, column=1, value=text).alignment = Alignment(wrap_text=True)
             row_cursor += 1
         if layout.grid and layout.grid.rows:
@@ -504,15 +642,25 @@ def ocr_pdf_to_xlsx(src: Path, dst: Path, dpi: int = 200) -> dict:
     return {"pages": len(pages), "tables": tables, "ocr": True}
 
 
-def ocr_images_to_docx(images: Sequence[Path], dst: Path) -> dict:
-    doc = _new_ocr_document()
+def ocr_images_to_docx(images: Sequence[Path], dst: Path, fidelity: bool = True) -> dict:
+    first = PILImage.open(images[0])
+    width_px, height_px = first.size
+    # نطابق عرض الصورة مع عرض A4 ليبقى التنسيق بنفس نسب الأصل
+    a4_width_pt = 595.0
+    pt_per_px = a4_width_pt / max(1, width_px)
+    page_h_pt = height_px * pt_per_px
+
+    doc = _new_ocr_document(a4_width_pt, page_h_pt)
     pages = 0
     text_found = 0
+    usable = a4_width_pt - 2 * MARGIN_PT
     for index, img_path in enumerate(images):
         page = ocr_engine.ocr_image(PILImage.open(img_path))
         layout = ocr_engine.analyze_page(page)
         label = f"— صورة {index + 1} من {len(images)} —" if len(images) > 1 else None
-        _emit_layout(doc, layout, first=index == 0, label=label)
+        _emit_layout(
+            doc, layout, pt_per_px, usable, first=index == 0, label=label, fidelity=fidelity
+        )
         pages += 1
         if layout.grid or layout.before or layout.after or layout.paragraphs:
             text_found += 1
@@ -531,7 +679,7 @@ def ocr_images_to_xlsx(images: Sequence[Path], dst: Path) -> dict:
         ws = wb.create_sheet(_safe_sheet_name(f"صورة {index}", used))
         ws.sheet_view.rightToLeft = True
         row_cursor = 1
-        for text in layout.before:
+        for text, _align in layout.before:
             ws.cell(row=row_cursor, column=1, value=text).alignment = Alignment(wrap_text=True)
             row_cursor += 1
         if layout.grid and layout.grid.rows:
@@ -606,6 +754,7 @@ def convert(
     out_dir: Path,
     work_dir: Path,
     use_ocr: bool = True,
+    fidelity: bool = True,
 ) -> tuple[Path, dict]:
     """يحوّل ملفًا واحدًا أو مجموعة ملفات متجانسة، ويرجّع (مسار الناتج، تفاصيل)."""
     if not srcs:
@@ -628,7 +777,7 @@ def convert(
         dst = out_dir / f"{stem}_و{len(images) - 1}{TARGET_EXT[target]}"
         if target == "docx":
             if use_ocr:
-                meta = ocr_images_to_docx(images, dst)
+                meta = ocr_images_to_docx(images, dst, fidelity=fidelity)
                 if meta.get("with_text"):
                     return dst, meta
             return dst, images_to_docx(images, dst)
@@ -648,7 +797,7 @@ def convert(
             scanned = use_ocr and needs_ocr(src)
             if target == "docx":
                 if scanned:
-                    return dst, ocr_pdf_to_docx(src, dst)
+                    return dst, ocr_pdf_to_docx(src, dst, fidelity=fidelity)
                 pdf_to_docx(src, dst)
                 return dst, {"pages": None}
             if target == "xlsx":
@@ -659,7 +808,7 @@ def convert(
         # صورة واحدة
         if target == "docx":
             if use_ocr:
-                meta = ocr_images_to_docx([src], dst)
+                meta = ocr_images_to_docx([src], dst, fidelity=fidelity)
                 if meta.get("with_text"):
                     return dst, meta
             return dst, images_to_docx([src], dst)

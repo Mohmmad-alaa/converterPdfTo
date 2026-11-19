@@ -20,6 +20,7 @@
   const results = $("results");
   const resultList = $("resultList");
   const ocrToggle = $("ocrToggle");
+  const fidelityToggle = $("fidelityToggle");
   const toastEl = $("toast");
 
   const state = { files: [], target: "docx", busy: false };
@@ -133,6 +134,7 @@
     const form = new FormData();
     form.append("target", state.target);
     form.append("ocr", useOcr ? "1" : "0");
+    form.append("fid", fidelityToggle.checked ? "1" : "0");
     state.files.forEach((f) => form.append("files", f, f.name));
 
     const slowHint = useOcr ? " قد يستغرق الملف الممسوح دقيقة تقريبًا." : "";
