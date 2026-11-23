@@ -84,9 +84,11 @@ def _autosize_columns(ws) -> None:
             if value is None:
                 continue
             text = str(value)
-            # النص العربي يبدو أعرض بصريًا
-            length = max(len(line) for line in text.splitlines()) + text.count(" ") * 0.4
-            widths[idx] = max(widths.get(idx, 8), min(int(length) + 3, 60))
+            # النص العربي يبدو أعرض بصريًا — نضيف 60% للعرض
+            raw = max(len(line) for line in text.splitlines()) if text else 0
+            arabic_extra = sum(1 for c in text if "\u0600" <= c <= "\u06FF") * 0.6
+            length = raw + arabic_extra
+            widths[idx] = max(widths.get(idx, 8), min(int(length) + 4, 65))
     for idx, width in widths.items():
         ws.column_dimensions[get_column_letter(idx)].width = width
 
@@ -123,6 +125,42 @@ def pdf_to_docx(src: Path, dst: Path) -> None:
     finally:
         cv.close()
 
+    # تحسين المستند الناتج: تعيين اتجاه RTL وخط مناسب للعربية
+    try:
+        doc = Document(str(dst))
+        style = doc.styles["Normal"]
+        rFonts = style.element.get_or_add_rPr().get_or_add_rFonts()
+        rFonts.set(qn("w:cs"), ARABIC_FONT)
+
+        for paragraph in doc.paragraphs:
+            text = paragraph.text or ""
+            if _has_arabic(text):
+                _rtl_paragraph(paragraph)
+            for run in paragraph.runs:
+                if run.text and _has_arabic(run.text):
+                    rPr = run._element.get_or_add_rPr()
+                    rF = rPr.get_or_add_rFonts()
+                    rF.set(qn("w:cs"), ARABIC_FONT)
+                    if rPr.find(qn("w:rtl")) is None:
+                        _insert_ordered(rPr, OxmlElement("w:rtl"), _AFTER_RTL)
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        text = paragraph.text or ""
+                        if _has_arabic(text):
+                            _rtl_paragraph(paragraph)
+                        for run in paragraph.runs:
+                            if run.text and _has_arabic(run.text):
+                                rPr = run._element.get_or_add_rPr()
+                                rF = rPr.get_or_add_rFonts()
+                                rF.set(qn("w:cs"), ARABIC_FONT)
+
+        doc.save(str(dst))
+    except Exception:
+        pass  # الأصل محفوظ
+
 
 # --------------------------------------------------------------------------
 # PDF  ->  Excel
@@ -137,11 +175,18 @@ def _write_table(ws, table: list[list], start_row: int = 1) -> int:
         for c, cell in enumerate(row, start=1):
             value = "" if cell is None else str(cell).strip()
             target = ws.cell(row=row_idx, column=c, value=value)
-            target.alignment = Alignment(vertical="center", wrap_text=True)
+            target.alignment = Alignment(
+                vertical="center",
+                horizontal="right" if _has_arabic(value) else "center",
+                wrap_text=True,
+            )
             target.border = BORDER
             if r == 0:
                 target.font = HEADER_FONT
                 target.fill = HEADER_FILL
+                target.alignment = Alignment(
+                    vertical="center", horizontal="center", wrap_text=True
+                )
         row_idx += 1
     return row_idx
 
@@ -235,7 +280,7 @@ def pdf_to_pptx(src: Path, dst: Path, work_dir: Path) -> dict:
     try:
         for idx in range(min(doc.page_count, MAX_PDF_PAGES)):
             page = doc.load_page(idx)
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=200)
             img_path = work_dir / f"_p{idx + 1}.png"
             pix.save(str(img_path))
             _add_picture_slide(prs, img_path)
@@ -336,7 +381,20 @@ def images_to_pptx(images: Sequence[Path], dst: Path, work_dir: Path) -> dict:
 # --------------------------------------------------------------------------
 # OCR  —  تحويل الصور وملفات PDF الممسوحة إلى نص حقيقي
 # --------------------------------------------------------------------------
-ARABIC_FONT = "Arial"
+# الخطوط: خط نسخي عربي قريب من المستندات الرسمية، وArial للأرقام والإنجليزية
+# Arabic Typesetting أضيق من Arial، لذلك يسمح بحجم أكبر دون زيادة عدد الصفحات
+ARABIC_FONT = "Arabic Typesetting"
+LATIN_FONT = "Arial"
+
+# معاملات مُعايرة على المسح الأصلي (A3) بحيث يبقى الناتج 7 صفحات
+BODY_FONT_FACTOR = 1.12
+CELL_FONT_FACTOR = 1.08
+BODY_MIN_PT, BODY_MAX_PT = 8.0, 16.0
+CELL_MIN_PT, CELL_MAX_PT = 6.5, 14.0
+CELL_DEFAULT_PT = 8.5
+ROW_HEIGHT_FACTOR = 1.0
+BODY_LINE_SPACING = 0.78
+BODY_AFTER_PT = 0.0
 
 # ترتيب العناصر مطلوب بحسب معيار OOXML، وإلا تجاهلها Word
 _AFTER_BIDI = (
@@ -371,14 +429,15 @@ def _rtl_paragraph(paragraph) -> None:
 def _rtl_run(run, size: float, bold: bool = False, gray: bool = False) -> None:
     run.font.size = Pt(size)
     run.font.bold = bold
-    run.font.name = ARABIC_FONT
+    run.font.name = LATIN_FONT
     if gray:
         run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
     rPr = run._element.get_or_add_rPr()
     rFonts = rPr.get_or_add_rFonts()
+    # w:cs للعربية، w:ascii/w:hAnsi للإنجليزية والأرقام
     rFonts.set(qn("w:cs"), ARABIC_FONT)
-    rFonts.set(qn("w:ascii"), ARABIC_FONT)
-    rFonts.set(qn("w:hAnsi"), ARABIC_FONT)
+    rFonts.set(qn("w:ascii"), LATIN_FONT)
+    rFonts.set(qn("w:hAnsi"), LATIN_FONT)
 
     size_cs = OxmlElement("w:szCs")
     size_cs.set(qn("w:val"), str(int(size * 2)))
@@ -394,20 +453,22 @@ def _add_arabic_paragraph(
     doc, text: str, size: float = 11, bold: bool = False, gray: bool = False, align: str | None = None
 ):
     paragraph = doc.add_paragraph()
-    _rtl_paragraph(paragraph)
-    if align == "center":
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    elif align == "left":
+    if align == "left":
+        # سطر لاتيني: فقرة LTR — في فقرة RTL يُقلَب معنى left/right في Word
         paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    else:
+        _rtl_paragraph(paragraph)
+        if align == "center":
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     paragraph.paragraph_format.space_before = Pt(0)
-    paragraph.paragraph_format.space_after = Pt(0.5)
-    paragraph.paragraph_format.line_spacing = 0.92
+    paragraph.paragraph_format.space_after = Pt(BODY_AFTER_PT)
+    paragraph.paragraph_format.line_spacing = BODY_LINE_SPACING
     run = paragraph.add_run(text)
     _rtl_run(run, size, bold=bold, gray=gray)
     return paragraph
 
 
-def _set_cell_margins(table, top: int = 15, bottom: int = 15, left: int = 50, right: int = 50) -> None:
+def _set_cell_margins(table, top: int = 15, bottom: int = 15, left: int = 70, right: int = 70) -> None:
     margins = OxmlElement("w:tblCellMar")
     for tag, value in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
         node = OxmlElement(f"w:{tag}")
@@ -419,10 +480,48 @@ def _set_cell_margins(table, top: int = 15, bottom: int = 15, left: int = 50, ri
     )
 
 
+# ألوان التصميم — هادئة ومناسبة للطباعة
+INK = "1F2937"
+BORDER_INNER = "AEB6C6"
+BORDER_OUTER = "7C879B"
+HEADER_FILL = "E8EDF7"
+BAND_FILL = "F7F9FC"
+
+
+def _table_borders(table, inner: str = BORDER_INNER, outer: str = BORDER_OUTER) -> None:
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        node = OxmlElement(f"w:{edge}")
+        node.set(qn("w:val"), "single")
+        node.set(qn("w:sz"), "6" if edge in ("top", "left", "bottom", "right") else "4")
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), outer if edge in ("top", "left", "bottom", "right") else inner)
+        borders.append(node)
+    _insert_ordered(
+        table._tbl.tblPr,
+        borders,
+        ("w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
+    )
+
+
+def _shade_cell(cell, fill: str) -> None:
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill)
+    _insert_ordered(
+        tcPr,
+        shd,
+        ("w:noWrap", "w:tcMar", "w:textDirection", "w:tcFitText", "w:vAlign", "w:hideMark"),
+    )
+
+
 def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity: bool = True) -> None:
     """
     يبني جدول Word بقياسات الصفحة الأصلية:
-    عرض كل عمود وارتفاع كل صف وحجم خط الخلية مأخوذة من الصورة نفسها.
+    عرض كل عمود وارتفاع كل صف وحجم خط الخلية مأخوذة من الصورة نفسها،
+    مع طبقة تنسيق: ترويسة مظللة، صفوف متبادلة، وحدود ناعمة.
     """
     rows = grid.rows
     n_cols = grid.n_cols
@@ -442,6 +541,7 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
         table._tbl.tblPr, layout, ("w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription")
     )
     _set_cell_margins(table)
+    _table_borders(table)
 
     # عرض الأعمدة من حدود الجدول الأصلية، مع تقليص متناسب إن تجاوز عرض الصفحة
     scale = 1.0
@@ -450,8 +550,8 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
         raw = [max(10.0, (b[1] - b[0]) * pt_per_px) for b in grid.col_bounds]
         total = sum(raw)
         if total > 0 and usable_width_pt > 0:
-            # نملأ عرض الصفحة كما في الأصل، بسقف يمنع التمدد المبالغ
-            scale = min(1.35, usable_width_pt / total)
+            # نملأ عرض الصفحة بالكامل كما في الأصل
+            scale = usable_width_pt / total
         widths = [w * scale for w in raw]
         for index, width in enumerate(widths):
             table.columns[index].width = Pt(width)
@@ -461,12 +561,20 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
     for r, cells_text in enumerate(rows):
         row = table.rows[r]
         if fidelity and r < len(grid.row_bounds):
-            # ارتفاع الصف من خطوط الجدول الأصلية — لا يُقاس بمعامل العرض
+            # ارتفاع الصف من خطوط الجدول الأصلية
             height = (grid.row_bounds[r][1] - grid.row_bounds[r][0]) * pt_per_px
-            row.height = Pt(max(12.0, height))
+            row.height = Pt(max(14.0, height * ROW_HEIGHT_FACTOR))
             row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+        trPr = row._tr.get_or_add_trPr()
+        trPr.append(OxmlElement("w:cantSplit"))
         if r < header_rows:
-            row._tr.get_or_add_trPr().append(OxmlElement("w:tblHeader"))
+            trPr.append(OxmlElement("w:tblHeader"))
+
+        fill = None
+        if r < header_rows:
+            fill = HEADER_FILL
+        elif (r - header_rows) % 2 == 1:
+            fill = BAND_FILL
 
         for c in range(n_cols):
             cell = row.cells[c]
@@ -480,16 +588,25 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
             paragraph.paragraph_format.space_after = Pt(0)
             paragraph.paragraph_format.line_spacing = 1.0
 
-            size = 8.5
+            size = CELL_DEFAULT_PT
             if fidelity and r < len(grid.cell_heights):
                 heights = grid.cell_heights[r]
                 if c < len(heights) and heights[c]:
-                    size = max(6.5, min(13.0, heights[c] * pt_per_px * 0.88))
+                    size = max(
+                        CELL_MIN_PT,
+                        min(CELL_MAX_PT, heights[c] * pt_per_px * CELL_FONT_FACTOR),
+                    )
+
+            if fill:
+                _shade_cell(cell, fill)
 
             if r < header_rows or (text and _is_numeric(text)):
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = paragraph.add_run(text)
-            _rtl_run(run, size, bold=r < header_rows)
+            if r < header_rows:
+                _rtl_run(run, size + 0.5, bold=True)
+            else:
+                _rtl_run(run, size)
 
 
 def _is_numeric(text: str) -> bool:
@@ -506,14 +623,21 @@ def _emit_layout(
     label: str | None = None,
     fidelity: bool = True,
 ) -> None:
-    anchor = _page_label_text(doc, label) if label else None
+    anchor = None
 
-    body_size = 11.0
+    body_size = 12.0
     if fidelity and layout.text_height:
-        body_size = max(7.5, min(16.0, layout.text_height * pt_per_px * 0.86))
+        body_size = max(
+            BODY_MIN_PT,
+            min(BODY_MAX_PT, layout.text_height * pt_per_px * BODY_FONT_FACTOR),
+        )
 
     for text, align in layout.before:
-        paragraph = _add_arabic_paragraph(doc, text, size=body_size, align=align)
+        # سطر مركزي قصير = عنوان فرعي يستحق التمييز
+        is_title = align == "center"
+        paragraph = _add_arabic_paragraph(
+            doc, text, size=body_size, bold=is_title, align=align
+        )
         if anchor is None:
             anchor = paragraph
 
@@ -522,7 +646,7 @@ def _emit_layout(
         spacer = doc.add_paragraph()
         spacer.paragraph_format.space_before = Pt(0)
         spacer.paragraph_format.space_after = Pt(0)
-        spacer.paragraph_format.line_spacing = Pt(min(150.0, max(4.0, layout.gap_before * pt_per_px)))
+        spacer.paragraph_format.line_spacing = Pt(min(120.0, max(2.0, layout.gap_before * pt_per_px * 0.6)))
         spacer.add_run("").font.size = Pt(1)
 
     if layout.grid and layout.grid.rows:
@@ -532,8 +656,10 @@ def _emit_layout(
             anchor.add_run("").font.size = Pt(1)
         _add_ocr_table(doc, layout.grid, pt_per_px, usable_width_pt, fidelity=fidelity)
     for text, align in layout.after:
+        if _is_footer_noise(text):
+            continue
         _add_arabic_paragraph(
-            doc, text, size=max(7.0, body_size - 1.5), gray=True, align=align
+            doc, text, size=max(8.0, body_size - 1.5), gray=True, align=align
         )
 
     if not first and anchor is not None:
@@ -541,6 +667,80 @@ def _emit_layout(
 
 
 MARGIN_PT = 18.0
+
+
+def _is_footer_noise(text: str) -> bool:
+    """أسطر ترقيم الصفحات المطبوعة في الأصل — لدينا تذييل حقيقي بدلها."""
+    compact = " ".join(text.split()).lower()
+    return bool(
+        re.fullmatch(r"page\s*\d+\s*(of|/)\s*\d+", compact)
+        or re.fullmatch(r"\d+\s*من\s*\d+", compact)
+    )
+
+
+def _add_field_run(paragraph, code: str, size: float = 8) -> None:
+    """يُدرج حقل Word (مثل PAGE أو NUMPAGES) داخل فقرة."""
+    run = paragraph.add_run()
+    run.font.size = Pt(size)
+    run.font.name = LATIN_FONT
+    run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
+    element = run._r
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = f" {code} "
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    placeholder = OxmlElement("w:t")
+    placeholder.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for node in (begin, instr, separate, placeholder, end):
+        element.append(node)
+
+
+def _add_footer(doc) -> None:
+    """تذييل مركزي: «صفحة X من Y» مع خط فاصل رقيق."""
+    section = doc.sections[0]
+    section.footer_distance = Pt(8)
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    paragraph = footer.paragraphs[0]
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_before = Pt(6)
+    paragraph.paragraph_format.space_after = Pt(0)
+
+    pPr = paragraph._p.get_or_add_pPr()
+    border = OxmlElement("w:pBdr")
+    top = OxmlElement("w:top")
+    top.set(qn("w:val"), "single")
+    top.set(qn("w:sz"), "4")
+    top.set(qn("w:space"), "6")
+    top.set(qn("w:color"), "D5DAE3")
+    border.append(top)
+    _insert_ordered(
+        pPr,
+        border,
+        ("w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap",
+         "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi",
+         "w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing",
+         "w:mirrorIndents", "w:suppressOverlap", "w:jc", "w:textDirection",
+         "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle",
+         "w:rPr", "w:sectPr", "w:pPrChange"),
+    )
+
+    def _label_run(text: str):
+        run = paragraph.add_run(text)
+        run.font.size = Pt(8)
+        run.font.name = ARABIC_FONT
+        run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
+        return run
+
+    _label_run("صفحة ")
+    _add_field_run(paragraph, "PAGE")
+    _label_run(" من ")
+    _add_field_run(paragraph, "NUMPAGES")
 
 
 def _new_ocr_document(
@@ -561,8 +761,10 @@ def _new_ocr_document(
     if sectPr.find(qn("w:bidi")) is None:
         _insert_ordered(sectPr, OxmlElement("w:bidi"), _AFTER_SECT_BIDI)
     style = doc.styles["Normal"]
-    style.font.name = ARABIC_FONT
+    style.font.name = LATIN_FONT
     style.font.size = Pt(11)
+    style.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:cs"), ARABIC_FONT)
+    _add_footer(doc)
     return doc
 
 
@@ -573,7 +775,7 @@ def _page_label_text(doc, label: str):
     run = paragraph.add_run(label)
     run.font.size = Pt(8)
     run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
-    run.font.name = ARABIC_FONT
+    run.font.name = LATIN_FONT
     return paragraph
 
 
@@ -607,7 +809,7 @@ def ocr_pdf_to_docx(src: Path, dst: Path, dpi: int = 200, fidelity: bool = True)
     return {"pages": len(pages), "ocr": True, "fidelity": fidelity}
 
 
-def ocr_pdf_to_xlsx(src: Path, dst: Path, dpi: int = 200) -> dict:
+def ocr_pdf_to_xlsx(src: Path, dst: Path, dpi: int = 250) -> dict:
     pages = ocr_engine.ocr_pdf(src, dpi=dpi)
     wb = Workbook()
     wb.remove(wb.active)
