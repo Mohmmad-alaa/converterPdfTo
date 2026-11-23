@@ -310,6 +310,8 @@ class Grid:
     row_bounds: list[tuple[float, float]] = field(default_factory=list)
     cell_heights: list[list[float]] = field(default_factory=list)
     header_rows: int = 1
+    # خلايا الترويسة المدمجة أفقيًا: (بداية العمود، نهايته، النص)
+    header_spans: list[tuple[int, int, str]] = field(default_factory=list)
 
     @property
     def header(self) -> list[str]:
@@ -506,103 +508,125 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
     for w in inside:
         matrix.setdefault((pick(w.cy, row_bands), pick(w.cx, col_bands)), []).append(w)
 
-    col_order = sorted(range(len(col_bands)), key=lambda i: -col_bands[i][0])
-
     def cell_text(items: list[Word]) -> str:
         return _join_words(items).strip()
 
-    # حذف الأعمدة الوهمية فقط: خطوط مزدوجة رقيقة أو رموز عابرة.
-    # الأعمدة الفارغة الحقيقية تبقى حتى يطابق الجدول أبعاد الأصل.
-    keep = []
+    def raw(r: int, c: int) -> str:
+        return cell_text(matrix.get((r, c), []))
+
     n_rows = len(row_bands)
-    for c in col_order:
-        left_x, right_x = col_bands[c]
-        if right_x - left_x < 25:
-            continue
-        cells = [cell_text(matrix.get((r, c), [])) for r in range(n_rows)]
-        filled = [text for text in cells if text]
-        if filled and len(filled) < n_rows * 0.2 and max(len(text) for text in filled) <= 2:
-            continue
-        keep.append(c)
-    if len(keep) < 2:
-        return None
+    # كل الأعمدة ذات العرض الحقيقي — لا نحذف عموداً لأنه فارغ فقط
+    real = [c for c in sorted(range(len(col_bands))) if col_bands[c][1] - col_bands[c][0] >= 25]
 
-    # الأعمدة الفارغة تمامًا (خطوط عابرة أو فراغ داخل خلية) تُحذف
-    def _has_data(column: int) -> bool:
-        return any(cell_text(matrix.get((r, column), [])) for r in range(n_rows))
+    # دمج الشقوق الوهمية: عمود عريض بلا أي نص ترويسة ليس عموداً مستقلاً
+    # (مثل الخط الوهمي داخل خلية «رقم الهوية / المالك» أو «رقم القطعة»)
+    groups: list[list[int]] = []
+    for c in real:
+        width = col_bands[c][1] - col_bands[c][0]
+        empty_header = not raw(0, c) and not raw(1, c)
+        if groups and width >= 120 and empty_header:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
 
-    keep = [c for c in keep if _has_data(c)]
-    if len(keep) < 2:
-        return None
+    def group_text(r: int, group: list[int]) -> str:
+        parts = [raw(r, c) for c in group]
+        return " ".join(p for p in parts if p).strip()
+
+    def group_width(group: list[int]) -> float:
+        return col_bands[group[-1]][1] - col_bands[group[0]][0]
+
+    # صفّا الترويسة: عناوين رئيسية في الأول، وأعمدة فرعية (د/ف/م2) في الثاني
+    header_top = [group_text(0, g) for g in groups]
+    header_bottom = [group_text(1, g) for g in groups]
+    header_spans: list[tuple[int, int, str]] = []
+
+    span_members: set[int] = set()
+    for i, group in enumerate(groups):
+        if i in span_members or header_top[i] or group_width(group) >= 120:
+            continue
+        candidates = [
+            j
+            for j in (i + 1, i - 1)
+            if 0 <= j < len(groups) and header_top[j]
+        ]
+        parent = next(
+            (
+                j
+                for j in candidates
+                if "قيم" in header_top[j] or "مساح" in header_top[j]
+            ),
+            None,
+        )
+        if parent is None:
+            continue
+        parent_text = header_top[parent]
+        if "قيم" in parent_text:
+            parent_label, child_label = "د", "ف"
+        else:  # مساحة
+            parent_label, child_label = "م2", "د"
+        header_bottom[parent] = parent_label
+        header_bottom[i] = child_label
+        start, end = (parent, i) if parent < i else (i, parent)
+        header_spans.append((start, end, parent_text))
+        for k in range(start, end + 1):
+            header_top[k] = parent_text if k == start else ""
+        span_members.update(range(start, end + 1))
+
+    # بقية الأعمدة: دمج سطري الترويسة في عنوان واحد (نوع + الأرض = نوع الأرض)
+    for i, group in enumerate(groups):
+        if any(start <= i <= end for start, end, _ in header_spans):
+            continue
+        if header_bottom[i]:
+            header_top[i] = f"{header_top[i]} {header_bottom[i]}".strip()
+            header_bottom[i] = ""
 
     rows: list[list[str]] = []
     row_heights: list[list[float]] = []
     row_indices: list[int] = []
-    for r in range(len(row_bands)):
-        cells = [cell_text(matrix.get((r, c), [])) for c in keep]
-        if any(cells):
+    for r in range(n_rows):
+        cells = [group_text(r, g) for g in groups]
+        if r == 0:
+            cells = list(header_top)
+        elif r == 1:
+            cells = list(header_bottom)
+        if any(cells) or r < 2:
             rows.append(cells)
             row_indices.append(r)
             row_heights.append(
                 [
-                    _median([w.height for w in matrix.get((r, c), [])]) or 0.0
-                    for c in keep
+                    max(
+                        (_median([w.height for w in matrix.get((r, c), [])]) or 0.0)
+                        for c in group
+                    )
+                    for group in groups
                 ]
             )
     if len(rows) < 3:
         return None
 
-    header_rows = 1
-    merged_header = False
-    # دمج صفّي الترويسة إن كانا متكاملين (مثل: "رقم" + "القطعة")
-    if len(rows) >= 2:
-        first, second = rows[0], rows[1]
-        n = len(first)
-        filled_first = sum(1 for c in first if c)
-        filled_second = sum(1 for c in second if c)
-        has_digits = any(ch.isdigit() for cell in second for ch in cell)
-        if (
-            filled_first >= n * 0.5
-            and filled_second <= n * 0.6
-            and not has_digits
-            and filled_first + filled_second > max(filled_first, filled_second)
-        ):
-            merged: list[str] = []
-            complementary = False
-            for a, b in zip(first, second):
-                if a and b:
-                    merged.append(a if a == b else f"{a} {b}")
-                elif a or b:
-                    merged.append(a or b)
-                    complementary = True
-                else:
-                    merged.append("")
-            if complementary:
-                rows = [merged] + rows[2:]
-                row_heights = [
-                    [max(h1, h2) for h1, h2 in zip(row_heights[0], row_heights[1])]
-                ] + row_heights[2:]
-                row_indices = [row_indices[0]] + row_indices[2:]
-                merged_header = True
+    header_rows = 2 if any(header_bottom) or header_spans else 1
+    if header_rows == 1:
+        rows = [rows[0]] + rows[2:]
+        row_heights = [row_heights[0]] + row_heights[2:]
+        row_indices = [row_indices[0]] + row_indices[2:]
 
     # حدود الصفوف بالبكسل (بنفس ترتيب rows)
-    row_bounds: list[tuple[float, float]] = []
-    for i, r in enumerate(row_indices):
-        top_y, bottom_y = row_bands[r]
-        if i == 0 and merged_header:
-            bottom_y = row_bands[r + 1][1]
-        row_bounds.append((top_y, bottom_y))
+    row_bounds = [row_bands[r] for r in row_indices]
 
     layout = PageLayout()
     layout.page_width = float(page.width)
     layout.page_height = float(page.height)
     layout.grid = Grid(
         rows=rows,
-        n_cols=len(keep),
-        col_bounds=[col_bands[c] for c in keep],
+        n_cols=len(groups),
+        col_bounds=[
+            (col_bands[group[0]][0], col_bands[group[-1]][1]) for group in groups
+        ],
         row_bounds=row_bounds,
         cell_heights=row_heights,
         header_rows=header_rows,
+        header_spans=header_spans,
     )
     line_height = _median([w.height for w in words]) or 20
     above = [w for w in outside if w.cy < top]

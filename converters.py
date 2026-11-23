@@ -392,8 +392,8 @@ CELL_FONT_FACTOR = 1.08
 BODY_MIN_PT, BODY_MAX_PT = 8.0, 16.0
 CELL_MIN_PT, CELL_MAX_PT = 6.5, 14.0
 CELL_DEFAULT_PT = 8.5
-ROW_HEIGHT_FACTOR = 1.0
-BODY_LINE_SPACING = 0.78
+ROW_HEIGHT_FACTOR = 0.95
+BODY_LINE_SPACING = 0.75
 BODY_AFTER_PT = 0.0
 
 # ترتيب العناصر مطلوب بحسب معيار OOXML، وإلا تجاهلها Word
@@ -558,6 +558,18 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
 
     header_rows = grid.header_rows if fidelity else 1
 
+    # دمج خلايا الترويسة الرئيسية التي تغطي عمودين فرعيين (المساحة، القيمة)
+    header_spans = getattr(grid, "header_spans", []) if fidelity else []
+    span_end: dict[int, int] = {}
+    covered: set[tuple[int, int]] = set()
+    for start, end, _text in header_spans:
+        if start < 0 or end >= n_cols or start >= end:
+            continue
+        table.cell(0, start).merge(table.cell(0, end))
+        span_end[start] = end
+        for c in range(start + 1, end + 1):
+            covered.add((0, c))
+
     for r, cells_text in enumerate(rows):
         row = table.rows[r]
         if fidelity and r < len(grid.row_bounds):
@@ -577,10 +589,16 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
             fill = BAND_FILL
 
         for c in range(n_cols):
+            if (r, c) in covered:
+                continue
             cell = row.cells[c]
             text = cells_text[c] if c < len(cells_text) else ""
+            # أخطاء شائعة في الأرقام المفردة داخل الأعمدة الضيقة
+            if text.strip() in {"l", "I", "|"}:
+                text = "1"
             if widths:
-                cell.width = Pt(widths[c])
+                end = span_end.get(c) if r == 0 else None
+                cell.width = Pt(sum(widths[c : end + 1]) if end else widths[c])
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             paragraph = cell.paragraphs[0]
             _rtl_paragraph(paragraph)
@@ -603,8 +621,10 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
             if r < header_rows or (text and _is_numeric(text)):
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = paragraph.add_run(text)
-            if r < header_rows:
+            if r == 0:
                 _rtl_run(run, size + 0.5, bold=True)
+            elif r == 1:
+                _rtl_run(run, max(7.5, size), bold=True)
             else:
                 _rtl_run(run, size)
 
@@ -790,7 +810,7 @@ def _page_size_pt(src: Path) -> tuple[float, float]:
         doc.close()
 
 
-def ocr_pdf_to_docx(src: Path, dst: Path, dpi: int = 200, fidelity: bool = True) -> dict:
+def ocr_pdf_to_docx(src: Path, dst: Path, dpi: int = 250, fidelity: bool = True) -> dict:
     if fidelity:
         width_pt, height_pt = _page_size_pt(src)
     else:
