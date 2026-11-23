@@ -529,12 +529,8 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
-    _insert_ordered(
-        table._tbl.tblPr,
-        OxmlElement("w:bidiVisual"),
-        ("w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout",
-         "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
-    )
+    # الأعمدة مُخزّنة أصلاً بترتيبها البصري كما في الصورة (يسار ← يمين)،
+    # لذلك لا نضيف w:bidiVisual: بعض العارضات تعكسه مرة ثانية فينقلب الجدول.
     layout = OxmlElement("w:tblLayout")
     layout.set(qn("w:type"), "fixed")
     _insert_ordered(
