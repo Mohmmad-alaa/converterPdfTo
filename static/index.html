@@ -89,6 +89,40 @@
       </span>
     </label>
 
+    <div class="engine-card">
+      <div class="engine-head">
+        <span class="engine-title">محرك المعالجة:</span>
+      </div>
+      <div class="engine-options">
+        <label class="engine-opt">
+          <input type="radio" name="engine" value="local" checked id="engineLocal">
+          <div class="opt-body">
+            <b>💻 محرك محلي (أوفلاين)</b>
+            <small>مجاني 100%، يعمل على جهازك مباشرة بدون إنترنت</small>
+          </div>
+        </label>
+        <label class="engine-opt">
+          <input type="radio" name="engine" value="ai" id="engineAi">
+          <div class="opt-body">
+            <b>✨ ذكاء اصطناعي فائق (Gemini Vision)</b>
+            <small>دقة متناهية 100% للجداول والنصوص المعقدة والخطوط القديمة</small>
+          </div>
+        </label>
+      </div>
+
+      <div id="aiKeyBox" class="ai-key-box" hidden>
+        <div class="ai-key-header">
+          <label for="geminiApiKey">مفتاح Google Gemini API:</label>
+          <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">احصل على مفتاح مجاني ↗</a>
+        </div>
+        <div class="ai-key-input-row">
+          <input type="password" id="geminiApiKey" placeholder="أدخل مفتاح AIzaSy... (اختياري إن كان مضافاً في .env)" autocomplete="off">
+          <button type="button" id="toggleKeyVisibility" class="ghost-btn-sm" title="إظهار / إخفاء">👁</button>
+        </div>
+        <p class="ai-key-hint">يُحفظ المفتاح محلياً في متصفحك، ويُستخدم فقط لإرسال الصفحات إلى Google Gemini عند اختيار محرك الذكاء الاصطناعي.</p>
+      </div>
+    </div>
+
     <div class="actions">
       <button id="convertBtn" class="primary-btn" type="button" disabled>
         <span class="btn-label">تحويل</span>

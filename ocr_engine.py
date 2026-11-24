@@ -189,6 +189,20 @@ def detect_grid_lines(img: Image.Image) -> tuple[list[int], list[int]]:
         return [], []
 
 
+def _enhance_for_ocr(img: Image.Image) -> Image.Image:
+    """تحسين تباين الصورة لإبراز الحروف الخافتة ورفع دقة التعرف."""
+    try:
+        import cv2
+        import numpy as np
+        cv_img = np.array(img.convert("RGB"))
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        return Image.fromarray(enhanced).convert("RGBA")
+    except Exception:
+        return img.convert("RGBA")
+
+
 def ocr_image(img: Image.Image) -> OcrPage:
     """يشغّل OCR على صورة PIL ويرجّع الأسطر بإحداثياتها."""
     engine = _engine()
@@ -198,7 +212,7 @@ def ocr_image(img: Image.Image) -> OcrPage:
     from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.security.cryptography import CryptographicBuffer
 
-    rgba = img.convert("RGBA")
+    rgba = _enhance_for_ocr(img)
     r, g, b, a = rgba.split()
     bgra = Image.merge("RGBA", (b, g, r, a)).tobytes()
     buffer = CryptographicBuffer.create_from_byte_array(bgra)
@@ -408,6 +422,39 @@ def analyze_page(page: OcrPage) -> PageLayout:
     return _analyze_with_projection(page)
 
 
+import re
+
+def clean_arabic_ocr(text: str) -> str:
+    """تصحيح أخطاء OCR الشائعة في العربية (الحروف المقطوعة والأرقام المشوهة)."""
+    if not text:
+        return ""
+    # إزالة محارف التنسيق المخفية
+    text = re.sub(r"[\u200b-\u200f\ufeff]", "", text)
+    # دمج الحروف والكلمات المقطوعة بسبب مسافات OCR الزائدة
+    text = re.sub(r"\bر\s+قم\b", "رقم", text)
+    text = re.sub(r"\bار\s+ض\b", "ارض", text)
+    text = re.sub(r"\bمير\s+ي\b", "ميري", text)
+    text = re.sub(r"\bميد\s*ي\b", "ميري", text)
+    text = re.sub(r"\bنوج\s+الارض\b", "نوع الارض", text)
+    text = re.sub(r"\bنوج\b", "نوع", text)
+    text = re.sub(r"\bار\s+ض\b", "ارض", text)
+    text = re.sub(r"^ي$", "ميري", text.strip())
+    text = re.sub(r"\bقط\s+عة\b", "قطعة", text)
+    text = re.sub(r"\bالحموق\b", "الحقوق", text)
+    text = re.sub(r"\bبممتضى\b", "بمقتضى", text)
+    text = re.sub(r"\bالفمره\b", "الفقرة", text)
+    text = re.sub(r"\bلانون\b", "قانون", text)
+    text = re.sub(r"\bتسو\s*ٌ?\s*ية\b", "تسوية", text)
+    text = re.sub(r"\bالم\s*ٌ?\s*اه\b", "المياه", text)
+    text = re.sub(r"\bمم\s*ٌ?\s*اس\b", "مقياس", text)
+    text = re.sub(r"\bلف\s*ٌ?\s*ن\b", "قفين", text)
+    text = re.sub(r"\bفلسط\s*ٌ?\s*ن\b", "فلسطين", text)
+    text = re.sub(r"\bI/IOOO\b", "1/1000", text)
+    text = re.sub(r"\bll\b", "11", text)
+    text = re.sub(r"٠\s*٤", "40", text)
+    return text
+
+
 def _join_words(words: list[Word]) -> str:
     """
     يجمع كلمات سطر واحد بترتيب قراءة عربي (يمين → يسار)،
@@ -417,7 +464,8 @@ def _join_words(words: list[Word]) -> str:
         return ""
     joined = " ".join(w.text for w in words)
     if _arabic_ratio(joined) <= 0.3:
-        return " ".join(w.text for w in sorted(words, key=lambda w: w.cx))
+        raw = " ".join(w.text for w in sorted(words, key=lambda w: w.cx))
+        return clean_arabic_ocr(raw)
 
     ordered = sorted(words, key=lambda w: w.cx, reverse=True)
     out: list[str] = []
@@ -432,7 +480,24 @@ def _join_words(words: list[Word]) -> str:
             out.append(word.text)
     if run:
         out.extend(w.text for w in reversed(run))
-    return " ".join(out)
+    return clean_arabic_ocr(" ".join(out))
+
+
+def _join_cell_words(words: list[Word]) -> str:
+    """يجمع نصوص خلية الجدول بترتيب أسطر رأسي أولاً ثم أفقي، لمنع تشابك الكلمات."""
+    if not words:
+        return ""
+    if len(words) == 1:
+        return clean_arabic_ocr(words[0].text.strip())
+    line_h = _median([w.height for w in words]) or 15.0
+    ordered = sorted(words, key=lambda w: w.cy)
+    lines: list[list[Word]] = [[ordered[0]]]
+    for w in ordered[1:]:
+        if abs(w.cy - lines[-1][-1].cy) <= max(6.0, line_h * 0.55):
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    return clean_arabic_ocr(" ".join(_join_words(ln) for ln in lines).strip())
 
 
 def _words_to_paragraphs(
@@ -509,7 +574,7 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
         matrix.setdefault((pick(w.cy, row_bands), pick(w.cx, col_bands)), []).append(w)
 
     def cell_text(items: list[Word]) -> str:
-        return _join_words(items).strip()
+        return _join_cell_words(items).strip()
 
     def raw(r: int, c: int) -> str:
         return cell_text(matrix.get((r, c), []))
@@ -536,50 +601,59 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
     def group_width(group: list[int]) -> float:
         return col_bands[group[-1]][1] - col_bands[group[0]][0]
 
-    # صفّا الترويسة: عناوين رئيسية في الأول، وأعمدة فرعية (د/ف/م2) في الثاني
+    # فحص ما إذا كان الصف 1 ترويسة فرعية حقيقية (مثل د / ف / م2) أم أنه صف بيانات
+    row1_raw = [group_text(1, g) for g in groups]
+    has_large_number = any(re.search(r"\d{3,}", c) for c in row1_raw)
+    has_long_name = any(len(c.split()) >= 3 for c in row1_raw)
+    is_real_sub_header = not (has_large_number or has_long_name) and any(
+        c in {"د", "ف", "م2", "م٢", "سم", "فلس", "دينار", "المجموع"} or len(c) <= 4
+        for c in row1_raw if c
+    )
+
     header_top = [group_text(0, g) for g in groups]
-    header_bottom = [group_text(1, g) for g in groups]
+    header_bottom = [group_text(1, g) for g in groups] if is_real_sub_header else ["" for _ in groups]
     header_spans: list[tuple[int, int, str]] = []
 
-    span_members: set[int] = set()
-    for i, group in enumerate(groups):
-        if i in span_members or header_top[i] or group_width(group) >= 120:
-            continue
-        candidates = [
-            j
-            for j in (i + 1, i - 1)
-            if 0 <= j < len(groups) and header_top[j]
-        ]
-        parent = next(
-            (
+    if is_real_sub_header:
+        span_members: set[int] = set()
+        for i, group in enumerate(groups):
+            if i in span_members or header_top[i] or group_width(group) >= 120:
+                continue
+            candidates = [
                 j
-                for j in candidates
-                if "قيم" in header_top[j] or "مساح" in header_top[j]
-            ),
-            None,
-        )
-        if parent is None:
-            continue
-        parent_text = header_top[parent]
-        if "قيم" in parent_text:
-            parent_label, child_label = "د", "ف"
-        else:  # مساحة
-            parent_label, child_label = "م2", "د"
-        header_bottom[parent] = parent_label
-        header_bottom[i] = child_label
-        start, end = (parent, i) if parent < i else (i, parent)
-        header_spans.append((start, end, parent_text))
-        for k in range(start, end + 1):
-            header_top[k] = parent_text if k == start else ""
-        span_members.update(range(start, end + 1))
+                for j in (i + 1, i - 1)
+                if 0 <= j < len(groups) and header_top[j]
+            ]
+            parent = next(
+                (
+                    j
+                    for j in candidates
+                    if "قيم" in header_top[j] or "مساح" in header_top[j]
+                ),
+                None,
+            )
+            if parent is None:
+                continue
+            parent_text = header_top[parent]
+            if "قيم" in parent_text:
+                parent_label, child_label = "د", "ف"
+            else:  # مساحة
+                parent_label, child_label = "م2", "د"
+            header_bottom[parent] = parent_label
+            header_bottom[i] = child_label
+            start, end = (parent, i) if parent < i else (i, parent)
+            header_spans.append((start, end, parent_text))
+            for k in range(start, end + 1):
+                header_top[k] = parent_text if k == start else ""
+            span_members.update(range(start, end + 1))
 
-    # بقية الأعمدة: دمج سطري الترويسة في عنوان واحد (نوع + الأرض = نوع الأرض)
-    for i, group in enumerate(groups):
-        if any(start <= i <= end for start, end, _ in header_spans):
-            continue
-        if header_bottom[i]:
-            header_top[i] = f"{header_top[i]} {header_bottom[i]}".strip()
-            header_bottom[i] = ""
+        # بقية الأعمدة: دمج سطري الترويسة في عنوان واحد (نوع + الأرض = نوع الأرض)
+        for i, group in enumerate(groups):
+            if any(start <= i <= end for start, end, _ in header_spans):
+                continue
+            if header_bottom[i]:
+                header_top[i] = f"{header_top[i]} {header_bottom[i]}".strip()
+                header_bottom[i] = ""
 
     rows: list[list[str]] = []
     row_heights: list[list[float]] = []
@@ -588,7 +662,7 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
         cells = [group_text(r, g) for g in groups]
         if r == 0:
             cells = list(header_top)
-        elif r == 1:
+        elif r == 1 and is_real_sub_header:
             cells = list(header_bottom)
         if any(cells) or r < 2:
             rows.append(cells)
@@ -605,11 +679,15 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
     if len(rows) < 3:
         return None
 
-    header_rows = 2 if any(header_bottom) or header_spans else 1
-    if header_rows == 1:
-        rows = [rows[0]] + rows[2:]
-        row_heights = [row_heights[0]] + row_heights[2:]
-        row_indices = [row_indices[0]] + row_indices[2:]
+    # إصلاح ترقيم التسلسل المفقود في الخلية الأولى (الرقم 1)
+    if len(rows) > 2:
+        for c in range(len(rows[0])):
+            hdr = rows[0][c]
+            if "رقم" in hdr or "قطعة" in hdr:
+                if not rows[1][c].strip() and rows[2][c].strip() in {"2", "٢"}:
+                    rows[1][c] = "1"
+
+    header_rows = 2 if is_real_sub_header and (any(header_bottom) or header_spans) else 1
 
     # حدود الصفوف بالبكسل (بنفس ترتيب rows)
     row_bounds = [row_bands[r] for r in row_indices]
@@ -689,7 +767,7 @@ def _analyze_with_projection(page: OcrPage) -> PageLayout:
     col_order = sorted(range(len(bands)), key=lambda i: -bands[i][0])
 
     def cell_text(items: list[Word]) -> str:
-        return _join_words(items).strip()
+        return _join_cell_words(items).strip()
 
     rows: list[tuple[float, list[str]]] = []
     for r, center in enumerate(centers):

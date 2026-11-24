@@ -60,7 +60,15 @@ def _strip_prefix(path: Path) -> Path:
     return path
 
 
-def _run(paths: list[Path], target: str, job_dir: Path, use_ocr: bool = True, fidelity: bool = True):
+def _run(
+    paths: list[Path],
+    target: str,
+    job_dir: Path,
+    use_ocr: bool = True,
+    fidelity: bool = True,
+    engine: str = "local",
+    api_key: str | None = None,
+):
     """ينفّذ التحويل داخل خيط منفصل (عمليات معالجة ثقيلة)."""
     out_dir = job_dir / "out"
     out_dir.mkdir(exist_ok=True)
@@ -71,18 +79,24 @@ def _run(paths: list[Path], target: str, job_dir: Path, use_ocr: bool = True, fi
 
     # عدة صور فقط -> تُدمج في ملف واحد (كل صورة صفحة/شريحة/صف)
     if len(paths) > 1 and len(images) == len(paths):
-        dst, meta = converters.convert(paths, target, out_dir, work_dir, use_ocr=use_ocr, fidelity=fidelity)
+        dst, meta = converters.convert(
+            paths, target, out_dir, work_dir, use_ocr=use_ocr, fidelity=fidelity, engine=engine, api_key=api_key
+        )
         return _strip_prefix(dst), {**meta, "files": len(paths), "zipped": False}
 
     # ملف واحد
     if len(paths) == 1:
-        dst, meta = converters.convert(paths, target, out_dir, work_dir, use_ocr=use_ocr, fidelity=fidelity)
+        dst, meta = converters.convert(
+            paths, target, out_dir, work_dir, use_ocr=use_ocr, fidelity=fidelity, engine=engine, api_key=api_key
+        )
         return _strip_prefix(dst), {**meta, "files": 1, "zipped": False}
 
     # خلط PDF وصور (أو عدة PDF) -> ملف لكل مدخل ثم ZIP
     produced: list[Path] = []
     for src in paths:
-        dst, _ = converters.convert([src], target, out_dir, work_dir, use_ocr=use_ocr, fidelity=fidelity)
+        dst, _ = converters.convert(
+            [src], target, out_dir, work_dir, use_ocr=use_ocr, fidelity=fidelity, engine=engine, api_key=api_key
+        )
         produced.append(dst)
 
     zip_path = out_dir / f"محوّل_{target}_{len(produced)}_ملفات.zip"
@@ -99,10 +113,14 @@ async def convert(
     files: list[UploadFile] = File(...),
     ocr: str = Form("1"),
     fid: str = Form("1"),
+    engine: str = Form("local"),
+    apiKey: str = Form(""),
 ):
     target = (target or "").lower().strip()
     use_ocr = str(ocr).lower() not in {"0", "false", "off", "no"}
     fidelity = str(fid).lower() not in {"0", "false", "off", "no"}
+    engine_choice = str(engine).lower().strip()
+    custom_key = str(apiKey).strip() or None
     if target not in converters.TARGET_EXT:
         raise HTTPException(400, "صيغة الهدف غير مدعومة.")
     if not files:
@@ -133,7 +151,9 @@ async def convert(
             saved.append(dest)
 
         try:
-            out_path, meta = await run_in_threadpool(_run, saved, target, job_dir, use_ocr, fidelity)
+            out_path, meta = await run_in_threadpool(
+                _run, saved, target, job_dir, use_ocr, fidelity, engine_choice, custom_key
+            )
         except HTTPException:
             raise
         except ValueError as exc:

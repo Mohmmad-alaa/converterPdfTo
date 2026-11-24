@@ -21,7 +21,40 @@
   const resultList = $("resultList");
   const ocrToggle = $("ocrToggle");
   const fidelityToggle = $("fidelityToggle");
+  const engineLocal = $("engineLocal");
+  const engineAi = $("engineAi");
+  const aiKeyBox = $("aiKeyBox");
+  const geminiApiKey = $("geminiApiKey");
+  const toggleKeyVisibility = $("toggleKeyVisibility");
   const toastEl = $("toast");
+
+  // استرجاع المفتاح المحفوظ
+  const savedApiKey = localStorage.getItem("muhawwil-gemini-key") || "";
+  if (geminiApiKey) geminiApiKey.value = savedApiKey;
+
+  const getSelectedEngine = () => (engineAi && engineAi.checked ? "ai" : "local");
+
+  function updateEngineUI() {
+    const isAi = getSelectedEngine() === "ai";
+    if (aiKeyBox) aiKeyBox.hidden = !isAi;
+  }
+
+  if (engineLocal && engineAi) {
+    engineLocal.addEventListener("change", updateEngineUI);
+    engineAi.addEventListener("change", updateEngineUI);
+  }
+
+  if (geminiApiKey) {
+    geminiApiKey.addEventListener("input", (e) => {
+      localStorage.setItem("muhawwil-gemini-key", e.target.value.trim());
+    });
+  }
+
+  if (toggleKeyVisibility && geminiApiKey) {
+    toggleKeyVisibility.addEventListener("click", () => {
+      geminiApiKey.type = geminiApiKey.type === "password" ? "text" : "password";
+    });
+  }
 
   const state = { files: [], target: "docx", busy: false };
 
@@ -131,13 +164,18 @@
     }
 
     const useOcr = ocrToggle.checked;
+    const engineMode = getSelectedEngine();
+    const apiKeyVal = geminiApiKey ? geminiApiKey.value.trim() : "";
+
     const form = new FormData();
     form.append("target", state.target);
     form.append("ocr", useOcr ? "1" : "0");
     form.append("fid", fidelityToggle.checked ? "1" : "0");
+    form.append("engine", engineMode);
+    form.append("apiKey", apiKeyVal);
     state.files.forEach((f) => form.append("files", f, f.name));
 
-    const slowHint = useOcr ? " قد يستغرق الملف الممسوح دقيقة تقريبًا." : "";
+    const slowHint = engineMode === "ai" ? " جاري المعالجة بالذكاء الاصطناعي..." : (useOcr ? " قد يستغرق الملف الممسوح دقيقة تقريبًا." : "");
     setBusy(true, "جارٍ رفع الملفات…");
 
     const xhr = new XMLHttpRequest();

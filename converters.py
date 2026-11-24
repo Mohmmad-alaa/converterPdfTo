@@ -45,12 +45,12 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 PDF_EXTS = {".pdf"}
 MAX_PDF_PAGES = 300
 
-# ألوان الهوية البصرية للملفات الناتجة
+# ألوان الهوية البصرية للملفات الناتجة (Excel)
 ACCENT = "4F46E5"
-HEADER_FILL = PatternFill("solid", fgColor="EEF2FF")
-HEADER_FONT = Font(bold=True, color="1E1B4B", size=11)
-THIN = Side(style="thin", color="D8DCF0")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+XL_HEADER_FILL = PatternFill("solid", fgColor="F1F5F9")
+XL_HEADER_FONT = Font(bold=True, color="0F172A", size=11)
+XL_THIN = Side(style="thin", color="94A3B8")
+XL_BORDER = Border(left=XL_THIN, right=XL_THIN, top=XL_THIN, bottom=XL_THIN)
 
 
 # --------------------------------------------------------------------------
@@ -180,10 +180,10 @@ def _write_table(ws, table: list[list], start_row: int = 1) -> int:
                 horizontal="right" if _has_arabic(value) else "center",
                 wrap_text=True,
             )
-            target.border = BORDER
+            target.border = XL_BORDER
             if r == 0:
-                target.font = HEADER_FONT
-                target.fill = HEADER_FILL
+                target.font = XL_HEADER_FONT
+                target.fill = XL_HEADER_FILL
                 target.alignment = Alignment(
                     vertical="center", horizontal="center", wrap_text=True
                 )
@@ -203,7 +203,7 @@ def _write_text_fallback(ws, text: str, title: str) -> None:
         for c, part in enumerate(parts or [line], start=1):
             cell = ws.cell(row=row_idx, column=c, value=part)
             cell.alignment = Alignment(vertical="center", wrap_text=True)
-            cell.border = BORDER
+            cell.border = XL_BORDER
         row_idx += 1
     if row_idx == 3:
         ws.cell(
@@ -468,7 +468,7 @@ def _add_arabic_paragraph(
     return paragraph
 
 
-def _set_cell_margins(table, top: int = 15, bottom: int = 15, left: int = 70, right: int = 70) -> None:
+def _set_cell_margins(table, top: int = 20, bottom: int = 20, left: int = 50, right: int = 50) -> None:
     margins = OxmlElement("w:tblCellMar")
     for tag, value in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
         node = OxmlElement(f"w:{tag}")
@@ -480,12 +480,12 @@ def _set_cell_margins(table, top: int = 15, bottom: int = 15, left: int = 70, ri
     )
 
 
-# ألوان التصميم — هادئة ومناسبة للطباعة
-INK = "1F2937"
-BORDER_INNER = "AEB6C6"
-BORDER_OUTER = "7C879B"
-HEADER_FILL = "E8EDF7"
-BAND_FILL = "F7F9FC"
+# ألوان التصميم — واضحة وأنيقة مطابقة للوثائق الرسمية
+INK = "111827"
+BORDER_INNER = "64748B"
+BORDER_OUTER = "334155"
+HEADER_FILL = "F1F5F9"
+BAND_FILL = "F8FAFC"
 
 
 def _table_borders(table, inner: str = BORDER_INNER, outer: str = BORDER_OUTER) -> None:
@@ -493,7 +493,7 @@ def _table_borders(table, inner: str = BORDER_INNER, outer: str = BORDER_OUTER) 
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         node = OxmlElement(f"w:{edge}")
         node.set(qn("w:val"), "single")
-        node.set(qn("w:sz"), "6" if edge in ("top", "left", "bottom", "right") else "4")
+        node.set(qn("w:sz"), "8" if edge in ("top", "left", "bottom", "right") else "4")
         node.set(qn("w:space"), "0")
         node.set(qn("w:color"), outer if edge in ("top", "left", "bottom", "right") else inner)
         borders.append(node)
@@ -529,8 +529,14 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
-    # الأعمدة مُخزّنة أصلاً بترتيبها البصري كما في الصورة (يسار ← يمين)،
-    # لذلك لا نضيف w:bidiVisual: بعض العارضات تعكسه مرة ثانية فينقلب الجدول.
+    # جدول RTL: العمود الأول منطقياً هو الأيمن. نعكس ترتيب الأعمدة عند الكتابة
+    # حتى يبقى الترتيب البصري مطابقاً للصورة (يمين: رقم القطعة، يسار: القيمة).
+    _insert_ordered(
+        table._tbl.tblPr,
+        OxmlElement("w:bidiVisual"),
+        ("w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout",
+         "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
+    )
     layout = OxmlElement("w:tblLayout")
     layout.set(qn("w:type"), "fixed")
     _insert_ordered(
@@ -549,21 +555,26 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
             # نملأ عرض الصفحة بالكامل كما في الأصل
             scale = usable_width_pt / total
         widths = [w * scale for w in raw]
-        for index, width in enumerate(widths):
-            table.columns[index].width = Pt(width)
+        for index in range(n_cols):
+            table.columns[index].width = Pt(widths[n_cols - 1 - index])
 
     header_rows = grid.header_rows if fidelity else 1
 
     # دمج خلايا الترويسة الرئيسية التي تغطي عمودين فرعيين (المساحة، القيمة)
     header_spans = getattr(grid, "header_spans", []) if fidelity else []
-    span_end: dict[int, int] = {}
+    span_text: dict[int, str] = {}
+    span_width: dict[int, float] = {}
     covered: set[tuple[int, int]] = set()
-    for start, end, _text in header_spans:
+    for start, end, text in header_spans:
         if start < 0 or end >= n_cols or start >= end:
             continue
-        table.cell(0, start).merge(table.cell(0, end))
-        span_end[start] = end
-        for c in range(start + 1, end + 1):
+        # عكس مواضع الدمج لتوافق ترتيب الأعمدة المنطقي RTL
+        first, last = n_cols - 1 - end, n_cols - 1 - start
+        table.cell(0, first).merge(table.cell(0, last))
+        span_text[first] = text
+        if widths:
+            span_width[first] = sum(widths[n_cols - 1 - k] for k in range(first, last + 1))
+        for c in range(first + 1, last + 1):
             covered.add((0, c))
 
     for r, cells_text in enumerate(rows):
@@ -587,14 +598,18 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
         for c in range(n_cols):
             if (r, c) in covered:
                 continue
+            src = n_cols - 1 - c
             cell = row.cells[c]
-            text = cells_text[c] if c < len(cells_text) else ""
+            text = cells_text[src] if src < len(cells_text) else ""
+            if r == 0 and c in span_text:
+                text = span_text[c]
             # أخطاء شائعة في الأرقام المفردة داخل الأعمدة الضيقة
             if text.strip() in {"l", "I", "|"}:
                 text = "1"
             if widths:
-                end = span_end.get(c) if r == 0 else None
-                cell.width = Pt(sum(widths[c : end + 1]) if end else widths[c])
+                cell.width = Pt(
+                    span_width[c] if r == 0 and c in span_width else widths[src]
+                )
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             paragraph = cell.paragraphs[0]
             _rtl_paragraph(paragraph)
@@ -605,10 +620,10 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
             size = CELL_DEFAULT_PT
             if fidelity and r < len(grid.cell_heights):
                 heights = grid.cell_heights[r]
-                if c < len(heights) and heights[c]:
+                if src < len(heights) and heights[src]:
                     size = max(
                         CELL_MIN_PT,
-                        min(CELL_MAX_PT, heights[c] * pt_per_px * CELL_FONT_FACTOR),
+                        min(CELL_MAX_PT, heights[src] * pt_per_px * CELL_FONT_FACTOR),
                     )
 
             if fill:
@@ -616,6 +631,8 @@ def _add_ocr_table(doc, grid, pt_per_px: float, usable_width_pt: float, fidelity
 
             if r < header_rows or (text and _is_numeric(text)):
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
             run = paragraph.add_run(text)
             if r == 0:
                 _rtl_run(run, size + 0.5, bold=True)
@@ -648,14 +665,81 @@ def _emit_layout(
             min(BODY_MAX_PT, layout.text_height * pt_per_px * BODY_FONT_FACTOR),
         )
 
-    for text, align in layout.before:
-        # سطر مركزي قصير = عنوان فرعي يستحق التمييز
-        is_title = align == "center"
-        paragraph = _add_arabic_paragraph(
-            doc, text, size=body_size, bold=is_title, align=align
-        )
-        if anchor is None:
-            anchor = paragraph
+    def _emit_header(items: list[tuple[str, str]]) -> any:
+        # نجمع العناصر المتتالية التي تمثل نفس السطر (يمين + يسار أو يمين + وسط + يسار)
+        i = 0
+        first_anchor = None
+        while i < len(items):
+            curr_text, curr_align = items[i]
+            if len(curr_text) > 45 or (curr_align == "center" and len(curr_text) > 30):
+                p = _add_arabic_paragraph(doc, curr_text, size=body_size, bold=True, align=curr_align)
+                if first_anchor is None:
+                    first_anchor = p
+                i += 1
+                continue
+
+            line_parts = {curr_align: curr_text}
+            j = i + 1
+            while j < min(i + 3, len(items)):
+                nxt_text, nxt_align = items[j]
+                if len(nxt_text) > 40 or nxt_align in line_parts:
+                    break
+                line_parts[nxt_align] = nxt_text
+                j += 1
+
+            if len(line_parts) == 1:
+                is_title = curr_align == "center"
+                p = _add_arabic_paragraph(doc, curr_text, size=body_size if not is_title else body_size + 1, bold=is_title, align=curr_align)
+                if first_anchor is None:
+                    first_anchor = p
+            else:
+                # جدول ترويسة غير مرئي من صف واحد يجمع اليمين والوسط واليسار
+                t = doc.add_table(rows=1, cols=3)
+                t.alignment = WD_TABLE_ALIGNMENT.CENTER
+                t.autofit = False
+                _insert_ordered(
+                    t._tbl.tblPr,
+                    OxmlElement("w:bidiVisual"),
+                    ("w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout",
+                     "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
+                )
+                borders = OxmlElement("w:tblBorders")
+                for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                    node = OxmlElement(f"w:{edge}")
+                    node.set(qn("w:val"), "none")
+                    borders.append(node)
+                _insert_ordered(t._tbl.tblPr, borders, ("w:shd", "w:tblLayout", "w:tblCellMar"))
+
+                col_w = usable_width_pt / 3.0
+                for idx in range(3):
+                    t.columns[idx].width = Pt(col_w)
+
+                row = t.rows[0]
+                cell_map = {"right": row.cells[0], "center": row.cells[1], "left": row.cells[2]}
+                for pos, cell in cell_map.items():
+                    cell.width = Pt(col_w)
+                    p = cell.paragraphs[0]
+                    p.paragraph_format.space_before = Pt(0)
+                    p.paragraph_format.space_after = Pt(1)
+                    p.paragraph_format.line_spacing = 1.0
+                    if pos == "left":
+                        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    elif pos == "center":
+                        _rtl_paragraph(p)
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    else:
+                        _rtl_paragraph(p)
+                        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    txt = line_parts.get(pos, "")
+                    if txt:
+                        run = p.add_run(txt)
+                        _rtl_run(run, body_size, bold=True)
+                if first_anchor is None:
+                    first_anchor = row.cells[0].paragraphs[0]
+            i = j
+        return first_anchor
+
+    anchor = _emit_header(layout.before)
 
     # إعادة الفراغ الرأسي الذي كان يفصل النص عن الجدول في الأصل
     if fidelity and layout.gap_before > 0:
@@ -844,11 +928,15 @@ def ocr_pdf_to_xlsx(src: Path, dst: Path, dpi: int = 250) -> dict:
             for r, cells in enumerate(layout.grid.rows):
                 for c, value in enumerate(cells, start=1):
                     cell = ws.cell(row=row_cursor, column=c, value=value or None)
-                    cell.alignment = Alignment(vertical="center", wrap_text=True)
-                    cell.border = BORDER
+                    cell.alignment = Alignment(
+                        vertical="center",
+                        horizontal="center" if (r == 0 or (value and _is_numeric(value))) else "right",
+                        wrap_text=True,
+                    )
+                    cell.border = XL_BORDER
                     if r == 0:
-                        cell.font = HEADER_FONT
-                        cell.fill = HEADER_FILL
+                        cell.font = XL_HEADER_FONT
+                        cell.fill = XL_HEADER_FILL
                 row_cursor += 1
             tables += 1
         else:
@@ -907,11 +995,15 @@ def ocr_images_to_xlsx(images: Sequence[Path], dst: Path) -> dict:
             for r, cells in enumerate(layout.grid.rows):
                 for c, value in enumerate(cells, start=1):
                     cell = ws.cell(row=row_cursor, column=c, value=value or None)
-                    cell.alignment = Alignment(vertical="center", wrap_text=True)
-                    cell.border = BORDER
+                    cell.alignment = Alignment(
+                        vertical="center",
+                        horizontal="center" if (r == 0 or (value and _is_numeric(value))) else "right",
+                        wrap_text=True,
+                    )
+                    cell.border = XL_BORDER
                     if r == 0:
-                        cell.font = HEADER_FONT
-                        cell.fill = HEADER_FILL
+                        cell.font = XL_HEADER_FONT
+                        cell.fill = XL_HEADER_FILL
                 row_cursor += 1
             tables += 1
         else:
@@ -963,6 +1055,150 @@ def needs_ocr(src: Path, sample_dpi: int = 150) -> bool:
 
 
 # --------------------------------------------------------------------------
+# تحويل عبر الذكاء الاصطناعي (Gemini Vision)
+# --------------------------------------------------------------------------
+def ai_pdf_to_docx(src: Path, dst: Path, api_key: str | None = None, fidelity: bool = True) -> dict:
+    import pymupdf
+    import ai_engine
+
+    if fidelity:
+        width_pt, height_pt = _page_size_pt(src)
+    else:
+        width_pt, height_pt = 595.0, 842.0
+
+    doc = _new_ocr_document(width_pt, height_pt)
+    pdf = pymupdf.open(str(src))
+    pages_count = min(pdf.page_count, MAX_PDF_PAGES)
+    usable = width_pt - 2 * MARGIN_PT
+
+    for i in range(pages_count):
+        pix = pdf[i].get_pixmap(dpi=200)
+        img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+        layout = ai_engine.analyze_page_ai(img, api_key=api_key)
+        pt_per_px = 72.0 / 200.0
+        label = f"— صفحة {i + 1} من {pages_count} —" if pages_count > 1 else None
+        _emit_layout(doc, layout, pt_per_px, usable, first=(i == 0), label=label, fidelity=fidelity)
+
+    pdf.close()
+    doc.save(str(dst))
+    return {"pages": pages_count, "engine": "ai", "fidelity": fidelity}
+
+
+def ai_pdf_to_xlsx(src: Path, dst: Path, api_key: str | None = None) -> dict:
+    import pymupdf
+    import ai_engine
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    used: set[str] = set()
+    tables = 0
+
+    pdf = pymupdf.open(str(src))
+    pages_count = min(pdf.page_count, MAX_PDF_PAGES)
+    for i in range(pages_count):
+        pix = pdf[i].get_pixmap(dpi=200)
+        img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+        layout = ai_engine.analyze_page_ai(img, api_key=api_key)
+
+        ws = wb.create_sheet(_safe_sheet_name(f"صفحة {i + 1}", used))
+        ws.sheet_view.rightToLeft = True
+        row_cursor = 1
+        for text, _align in layout.before:
+            ws.cell(row=row_cursor, column=1, value=text).alignment = Alignment(wrap_text=True)
+            row_cursor += 1
+
+        if layout.grid and layout.grid.rows:
+            for r, cells in enumerate(layout.grid.rows):
+                for c, value in enumerate(cells, start=1):
+                    cell = ws.cell(row=row_cursor, column=c, value=value or None)
+                    cell.alignment = Alignment(
+                        vertical="center",
+                        horizontal="center" if (r < layout.grid.header_rows or (value and _is_numeric(value))) else "right",
+                        wrap_text=True,
+                    )
+                    cell.border = XL_BORDER
+                    if r < layout.grid.header_rows:
+                        cell.font = XL_HEADER_FONT
+                        cell.fill = XL_HEADER_FILL
+                row_cursor += 1
+            tables += 1
+        else:
+            for text in layout.paragraphs:
+                ws.cell(row=row_cursor, column=1, value=text)
+                row_cursor += 1
+        _autosize_columns(ws)
+
+    pdf.close()
+    if not wb.sheetnames:
+        wb.create_sheet("النتيجة")["A1"] = "لم يُعثر على نص."
+    wb.save(str(dst))
+    return {"pages": pages_count, "tables": tables, "engine": "ai"}
+
+
+def ai_images_to_docx(images: Sequence[Path], dst: Path, api_key: str | None = None, fidelity: bool = True) -> dict:
+    import ai_engine
+
+    first = PILImage.open(images[0])
+    width_px, height_px = first.size
+    a4_width_pt = 595.0
+    pt_per_px = a4_width_pt / max(1, width_px)
+    page_h_pt = height_px * pt_per_px
+
+    doc = _new_ocr_document(a4_width_pt, page_h_pt)
+    usable = a4_width_pt - 2 * MARGIN_PT
+    for index, img_path in enumerate(images):
+        img = PILImage.open(img_path)
+        layout = ai_engine.analyze_page_ai(img, api_key=api_key)
+        label = f"— صورة {index + 1} من {len(images)} —" if len(images) > 1 else None
+        _emit_layout(doc, layout, pt_per_px, usable, first=(index == 0), label=label, fidelity=fidelity)
+
+    doc.save(str(dst))
+    return {"pages": len(images), "engine": "ai", "fidelity": fidelity}
+
+
+def ai_images_to_xlsx(images: Sequence[Path], dst: Path, api_key: str | None = None) -> dict:
+    import ai_engine
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    used: set[str] = set()
+    tables = 0
+    for index, img_path in enumerate(images, start=1):
+        img = PILImage.open(img_path)
+        layout = ai_engine.analyze_page_ai(img, api_key=api_key)
+        ws = wb.create_sheet(_safe_sheet_name(f"صورة {index}", used))
+        ws.sheet_view.rightToLeft = True
+        row_cursor = 1
+        for text, _align in layout.before:
+            ws.cell(row=row_cursor, column=1, value=text).alignment = Alignment(wrap_text=True)
+            row_cursor += 1
+        if layout.grid and layout.grid.rows:
+            for r, cells in enumerate(layout.grid.rows):
+                for c, value in enumerate(cells, start=1):
+                    cell = ws.cell(row=row_cursor, column=c, value=value or None)
+                    cell.alignment = Alignment(
+                        vertical="center",
+                        horizontal="center" if (r < layout.grid.header_rows or (value and _is_numeric(value))) else "right",
+                        wrap_text=True,
+                    )
+                    cell.border = XL_BORDER
+                    if r < layout.grid.header_rows:
+                        cell.font = XL_HEADER_FONT
+                        cell.fill = XL_HEADER_FILL
+                row_cursor += 1
+            tables += 1
+        else:
+            for text in layout.paragraphs:
+                ws.cell(row=row_cursor, column=1, value=text)
+                row_cursor += 1
+        _autosize_columns(ws)
+    if not wb.sheetnames:
+        wb.create_sheet("النتيجة")["A1"] = "لم يُعثر على نص."
+    wb.save(str(dst))
+    return {"pages": len(images), "tables": tables, "engine": "ai"}
+
+
+# --------------------------------------------------------------------------
 # الموزّع الرئيسي
 # --------------------------------------------------------------------------
 TARGET_EXT = {"docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx"}
@@ -976,6 +1212,8 @@ def convert(
     work_dir: Path,
     use_ocr: bool = True,
     fidelity: bool = True,
+    engine: str = "local",
+    api_key: str | None = None,
 ) -> tuple[Path, dict]:
     """يحوّل ملفًا واحدًا أو مجموعة ملفات متجانسة، ويرجّع (مسار الناتج، تفاصيل)."""
     if not srcs:
@@ -991,18 +1229,23 @@ def convert(
         raise ValueError("نوع ملف غير مدعوم.")
 
     stem = re.sub(r'[\\/:*?"<>|]+', "_", srcs[0].stem)[:60] or "ملف"
-    use_ocr = bool(use_ocr) and ocr_engine.available()
+    is_ai = str(engine).lower().strip() == "ai"
+    use_ocr = bool(use_ocr) and (is_ai or ocr_engine.available())
 
     # 1) صور متعددة + هدف يقبل الدمج  ->  ملف واحد
     if images and not pdfs and len(images) > 1:
         dst = out_dir / f"{stem}_و{len(images) - 1}{TARGET_EXT[target]}"
         if target == "docx":
+            if is_ai:
+                return dst, ai_images_to_docx(images, dst, api_key=api_key, fidelity=fidelity)
             if use_ocr:
                 meta = ocr_images_to_docx(images, dst, fidelity=fidelity)
                 if meta.get("with_text"):
                     return dst, meta
             return dst, images_to_docx(images, dst)
         if target == "xlsx":
+            if is_ai:
+                return dst, ai_images_to_xlsx(images, dst, api_key=api_key)
             if use_ocr:
                 meta = ocr_images_to_xlsx(images, dst)
                 if meta.get("tables") or meta.get("pages"):
@@ -1015,6 +1258,13 @@ def convert(
         src = srcs[0]
         dst = out_dir / f"{stem}{TARGET_EXT[target]}"
         if is_pdf(src):
+            if is_ai:
+                if target == "docx":
+                    return dst, ai_pdf_to_docx(src, dst, api_key=api_key, fidelity=fidelity)
+                if target == "xlsx":
+                    return dst, ai_pdf_to_xlsx(src, dst, api_key=api_key)
+                return dst, pdf_to_pptx(src, dst, work_dir)
+
             scanned = use_ocr and needs_ocr(src)
             if target == "docx":
                 if scanned:
@@ -1028,12 +1278,16 @@ def convert(
             return dst, pdf_to_pptx(src, dst, work_dir)
         # صورة واحدة
         if target == "docx":
+            if is_ai:
+                return dst, ai_images_to_docx([src], dst, api_key=api_key, fidelity=fidelity)
             if use_ocr:
                 meta = ocr_images_to_docx([src], dst, fidelity=fidelity)
                 if meta.get("with_text"):
                     return dst, meta
             return dst, images_to_docx([src], dst)
         if target == "xlsx":
+            if is_ai:
+                return dst, ai_images_to_xlsx([src], dst, api_key=api_key)
             if use_ocr:
                 meta = ocr_images_to_xlsx([src], dst)
                 if meta.get("tables") or meta.get("pages"):
