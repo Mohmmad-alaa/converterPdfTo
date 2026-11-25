@@ -783,8 +783,7 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
 
                 # إعادة قراءة العمود الرقمي كاملًا بمحرّك إنجليزي مكبّر:
                 # أسرع من قراءة كل خلية على حدة، وأدق للأرقام الصغيرة/المقطوعة.
-                header_text = rows[0][c] + (" " + rows[1][c] if is_real_sub_header and len(rows) > 1 else "")
-                if page.image is not None and any(k in header_text for k in ("مساح", "قيم")):
+                if page.image is not None:
                     x0 = int(col_bands[group[0]][0]) + 3
                     x1 = int(col_bands[group[-1]][1]) - 3
                     y0 = int(row_bands[row_indices[data_start]][0]) + 3
@@ -807,10 +806,6 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                                 continue
                             cell = rows[target][c].strip()
                             if cell and not re.search(r"\d\s+\d", cell):
-                                continue
-                            # الخلايا الفارغة في صفوف الورثة غالبًا فارغة فعلاً؛
-                            # نعيد القراءة فقط إذا كان الصف يحمل أرقامًا أخرى كافية.
-                            if not cell and sum(1 for v in rows[target] if _is_numeric_like(v)) < 3:
                                 continue
                             old_digits = sum(ch.isdigit() for ch in cell)
                             new_digits = sum(ch.isdigit() for ch in fresh)
