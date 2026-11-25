@@ -67,6 +67,7 @@ class OcrPage:
     v_lines: list[int] = field(default_factory=list)
     h_lines: list[int] = field(default_factory=list)
     image: Image.Image | None = field(default=None, repr=False, compare=False)
+    native_words: list[Word] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -273,15 +274,41 @@ def ocr_image(img: Image.Image) -> OcrPage:
     return page
 
 
+def _attach_native_words(page: OcrPage, words, rect) -> None:
+    """يحوّل كلمات طبقة نص PDF إلى إحداثيات الصورة — احتياط للأرقام التي يفوّتها OCR."""
+    if not words or page.width <= 0 or page.height <= 0:
+        return
+    sx = page.width / max(1.0, rect.width)
+    sy = page.height / max(1.0, rect.height)
+    for item in words:
+        if len(item) < 5:
+            continue
+        text = str(item[4]).strip()
+        if not text or not any(ch.isdigit() for ch in text):
+            continue
+        page.native_words.append(
+            Word(
+                text=text,
+                x0=float(item[0]) * sx,
+                y0=float(item[1]) * sy,
+                x1=float(item[2]) * sx,
+                y1=float(item[3]) * sy,
+            )
+        )
+
+
 def ocr_pdf_page(path, index: int, dpi: int = 250) -> OcrPage:
     """يصيّر صفحة PDF إلى صورة ثم يشغّل عليها OCR."""
     import pymupdf
 
     doc = pymupdf.open(str(path))
     try:
-        pix = doc.load_page(index).get_pixmap(dpi=dpi)
+        pdf_page = doc.load_page(index)
+        pix = pdf_page.get_pixmap(dpi=dpi)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        return ocr_image(img)
+        page = ocr_image(img)
+        _attach_native_words(page, pdf_page.get_text("words"), pdf_page.rect)
+        return page
     finally:
         doc.close()
 
@@ -295,9 +322,14 @@ def ocr_pdf(path, dpi: int = 250, progress=None) -> list[OcrPage]:
     try:
         count = doc.page_count
         pixmaps = []
+        native = []
+        rects = []
         for i in range(count):
-            pix = doc.load_page(i).get_pixmap(dpi=dpi)
+            pdf_page = doc.load_page(i)
+            pix = pdf_page.get_pixmap(dpi=dpi)
             pixmaps.append(pix.tobytes("png"))
+            native.append(pdf_page.get_text("words"))
+            rects.append(pdf_page.rect)
     finally:
         doc.close()
 
@@ -307,6 +339,9 @@ def ocr_pdf(path, dpi: int = 250, progress=None) -> list[OcrPage]:
     workers = min(4, max(1, (len(pixmaps) or 1)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pages = list(pool.map(work, pixmaps))
+
+    for page, words, rect in zip(pages, native, rects):
+        _attach_native_words(page, words, rect)
 
     if progress:
         for i, _ in enumerate(pages, start=1):
@@ -781,6 +816,34 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                 for r in range(data_start, len(rows)):
                     rows[r][c] = _normalize_numeric_text(rows[r][c])
 
+                # احتياط أول: طبقة نص PDF قد تحمل الرقم الصحيح رغم تشوّه العربي.
+                if page.native_words:
+                    nx0 = col_bands[group[0]][0]
+                    nx1 = col_bands[group[-1]][1]
+                    for nw in page.native_words:
+                        if not (nx0 <= nw.cx <= nx1):
+                            continue
+                        target = next(
+                            (
+                                r
+                                for r in range(data_start, len(rows))
+                                if row_bands[row_indices[r]][0] <= nw.cy <= row_bands[row_indices[r]][1]
+                            ),
+                            None,
+                        )
+                        if target is None:
+                            continue
+                        cell = rows[target][c].strip()
+                        if cell and not re.search(r"\d\s+\d", cell):
+                            continue
+                        fresh = _normalize_numeric_text(nw.text)
+                        if not _is_numeric_like(fresh):
+                            continue
+                        old_digits = sum(ch.isdigit() for ch in cell)
+                        new_digits = sum(ch.isdigit() for ch in fresh)
+                        if new_digits > old_digits:
+                            rows[target][c] = fresh
+
                 # إعادة قراءة العمود الرقمي كاملًا بمحرّك إنجليزي مكبّر:
                 # أسرع من قراءة كل خلية على حدة، وأدق للأرقام الصغيرة/المقطوعة.
                 if page.image is not None:
@@ -811,6 +874,32 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                             new_digits = sum(ch.isdigit() for ch in fresh)
                             if new_digits > old_digits:
                                 rows[target][c] = fresh
+
+    # استكمال أرقام القطع المتسلسلة إذا فات OCR رقمًا واحدًا بين رقمين معروفين
+    plot_col = None
+    for c in range(len(rows[0])):
+        header = rows[0][c] + (" " + rows[1][c] if is_real_sub_header and len(rows) > 1 else "")
+        if "قطعة" in header and ("رقم" in header or "القطعة" in header):
+            plot_col = c
+            break
+    if plot_col is not None:
+        known = {
+            r: int(rows[r][plot_col].strip())
+            for r in range(data_start, len(rows))
+            if re.fullmatch(r"\d+", rows[r][plot_col].strip() or "")
+        }
+        ordered = sorted(known)
+        for left, right in zip(ordered, ordered[1:]):
+            gap = right - left - 1
+            if gap <= 0:
+                continue
+            blanks = [r for r in range(left + 1, right) if not rows[r][plot_col].strip()]
+            if len(blanks) != gap:
+                continue
+            if any(not any(rows[r][j].strip() for j in range(len(rows[r])) if j != plot_col) for r in blanks):
+                continue
+            for offset, r in enumerate(blanks, start=1):
+                rows[r][plot_col] = str(known[left] + offset)
 
     # إصلاح ترقيم التسلسل المفقود في الخلية الأولى (الرقم 1)
     if len(rows) > 2:
