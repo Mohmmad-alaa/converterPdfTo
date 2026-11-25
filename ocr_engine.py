@@ -170,20 +170,24 @@ def detect_grid_lines(img: Image.Image) -> tuple[list[int], list[int]]:
         v_proj = (vertical > 0).sum(axis=0)
 
         candidates: list[tuple[list[int], list[int]]] = []
-        for threshold in (0.15, 0.08, 0.06):
+        edge_margin = max(2, int(height * 0.005))
+        for threshold in (0.15, 0.12, 0.10, 0.08, 0.06):
             ys = _group_positions([i for i, c in enumerate(h_proj) if c > width * threshold])
+            # تجاهل حدود الصفحة نفسها (خطوط أعلى/أسفل الصورة) لأنها ليست صفوف جدول
+            ys = [y for y in ys if edge_margin < y < height - edge_margin]
             xs = _group_positions([i for i, c in enumerate(v_proj) if c > height * threshold])
             candidates.append((xs, ys))
-            # شبكة مكتملة: أعمدة وصفوف كافية — لا حاجة لمحاولة أخفض
-            if len(xs) >= 8 and len(ys) >= 20:
-                return xs, ys
 
         def score(item: tuple[list[int], list[int]]) -> int:
             xs_i, ys_i = item
+            if len(xs_i) < 2 or len(ys_i) < 3:
+                return -1
             if len(xs_i) > 25 or len(ys_i) > 90:  # ضجيج
                 return -1
             return len(xs_i) + len(ys_i)
 
+        # لا نتوقف عند أول عتبة: العتبة المرتفعة قد تلتقط أعلى الجدول فقط
+        # وتفوّت الصفوف السفلية الباهتة، لذلك نختار أفضل مرشح من كل العتبات.
         return max(candidates, key=score)
     except Exception:
         return [], []
