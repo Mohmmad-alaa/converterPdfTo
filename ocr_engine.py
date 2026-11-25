@@ -513,6 +513,43 @@ def _is_numeric_like(text: str) -> bool:
     return bool(text) and bool(_NUMERIC_TOKEN_RE.fullmatch(text))
 
 
+def _ocr_row_numeric_words(img: Image.Image) -> list[tuple[float, float, str]]:
+    """يقرأ صفًا كاملًا بمحرّك إنجليزي ويعيد (cx, cy, النص) للأرقام فقط."""
+    engine = _english_engine()
+    if engine is None or img.width < 8 or img.height < 8:
+        return []
+    try:
+        from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
+        from winrt.windows.security.cryptography import CryptographicBuffer
+
+        scale = 2
+        big = img.resize((img.width * scale, img.height * scale), Image.LANCZOS).convert("RGBA")
+        r, g, b, a = big.split()
+        bgra = Image.merge("RGBA", (b, g, r, a)).tobytes()
+        buffer = CryptographicBuffer.create_from_byte_array(bgra)
+        bitmap = SoftwareBitmap.create_copy_from_buffer(
+            buffer, BitmapPixelFormat.BGRA8, big.width, big.height, BitmapAlphaMode.PREMULTIPLIED
+        )
+        result = engine.recognize_async(bitmap).get()
+        out: list[tuple[float, float, str]] = []
+        for line in list(result.lines):
+            for word in list(line.words):
+                text = _normalize_numeric_text(word.text.strip())
+                if not _is_numeric_like(text):
+                    continue
+                rect = word.bounding_rect
+                out.append(
+                    (
+                        (rect.x + rect.width / 2) / scale,
+                        (rect.y + rect.height / 2) / scale,
+                        text,
+                    )
+                )
+        return out
+    except Exception:
+        return []
+
+
 def _ocr_numeric_strip(img: Image.Image) -> list[tuple[float, str]]:
     """يقرأ عمودًا رقميًا كاملًا بمحرّك إنجليزي مكبّر، ويعيد (y, النص) لكل سطر."""
     engine = _english_engine()
@@ -875,31 +912,32 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                             if new_digits > old_digits:
                                 rows[target][c] = fresh
 
-    # استكمال أرقام القطع المتسلسلة إذا فات OCR رقمًا واحدًا بين رقمين معروفين
+    # أرقام القطع المفردة: OCR يتجاهلها أحيانًا إذا قرأ الخلية وحدها،
+    # فنقرأ الصف كاملًا (سياق حقيقي) ونأخذ الرقم الواقع داخل عمود القطعة فقط.
     plot_col = None
     for c in range(len(rows[0])):
         header = rows[0][c] + (" " + rows[1][c] if is_real_sub_header and len(rows) > 1 else "")
         if "قطعة" in header and ("رقم" in header or "القطعة" in header):
             plot_col = c
             break
-    if plot_col is not None:
-        known = {
-            r: int(rows[r][plot_col].strip())
-            for r in range(data_start, len(rows))
-            if re.fullmatch(r"\d+", rows[r][plot_col].strip() or "")
-        }
-        ordered = sorted(known)
-        for left, right in zip(ordered, ordered[1:]):
-            gap = right - left - 1
-            if gap <= 0:
+    if plot_col is not None and page.image is not None:
+        px0 = col_bands[groups[plot_col][0]][0]
+        px1 = col_bands[groups[plot_col][-1]][1]
+        for r in range(data_start, len(rows)):
+            if rows[r][plot_col].strip():
                 continue
-            blanks = [r for r in range(left + 1, right) if not rows[r][plot_col].strip()]
-            if len(blanks) != gap:
+            if not any(rows[r][j].strip() for j in range(len(rows[r])) if j != plot_col):
                 continue
-            if any(not any(rows[r][j].strip() for j in range(len(rows[r])) if j != plot_col) for r in blanks):
+            y0 = int(row_bands[row_indices[r]][0]) + 2
+            y1 = int(row_bands[row_indices[r]][1]) - 2
+            if y1 - y0 < 8:
                 continue
-            for offset, r in enumerate(blanks, start=1):
-                rows[r][plot_col] = str(known[left] + offset)
+            row_img = page.image.crop((0, max(0, y0), page.width, min(page.height, y1)))
+            candidates = [
+                text for cx, _cy, text in _ocr_row_numeric_words(row_img) if px0 <= cx <= px1
+            ]
+            if candidates:
+                rows[r][plot_col] = max(candidates, key=lambda text: sum(ch.isdigit() for ch in text))
 
     # إصلاح ترقيم التسلسل المفقود في الخلية الأولى (الرقم 1)
     if len(rows) > 2:
