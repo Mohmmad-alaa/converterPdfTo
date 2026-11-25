@@ -428,6 +428,40 @@ def analyze_page(page: OcrPage) -> PageLayout:
 
 import re
 
+# الحروف اللاتينية التي يخلطها OCR مع الأرقام داخل الخلايا الرقمية
+_DIGIT_CONFUSABLE = str.maketrans(
+    {
+        "I": "1", "l": "1", "|": "1", "!": "1",
+        "O": "0", "o": "0", "Q": "0",
+        "S": "5", "s": "5",
+        "Z": "2", "z": "2",
+        "B": "8", "G": "6",
+    }
+)
+_NUMERIC_TOKEN_RE = re.compile(r"^[0-9٠-٩.,:/\-+%()\sIl|!OoQqSsZzBbGg]+$")
+
+
+def _normalize_digit_token(token: str, require_digit: bool = True) -> str:
+    """يصحح خلط الأرقام بالحروف فقط داخل رمز رقمي، ولا يمسّ الكلمات العربية."""
+    if not token:
+        return token
+    if require_digit and not any(ch.isdigit() for ch in token):
+        return token
+    if not _NUMERIC_TOKEN_RE.fullmatch(token):
+        return token
+    return token.translate(_DIGIT_CONFUSABLE)
+
+
+def _normalize_numeric_text(text: str) -> str:
+    """يطبّق تصحيح الأرقام على خلية رقمية كاملة (حتى لو كانت رمزًا واحدًا مثل l)."""
+    return " ".join(_normalize_digit_token(tok, require_digit=False) for tok in text.split())
+
+
+def _is_numeric_like(text: str) -> bool:
+    text = text.strip()
+    return bool(text) and bool(_NUMERIC_TOKEN_RE.fullmatch(text))
+
+
 def clean_arabic_ocr(text: str) -> str:
     """تصحيح أخطاء OCR الشائعة في العربية (الحروف المقطوعة والأرقام المشوهة)."""
     if not text:
@@ -456,6 +490,8 @@ def clean_arabic_ocr(text: str) -> str:
     text = re.sub(r"\bI/IOOO\b", "1/1000", text)
     text = re.sub(r"\bll\b", "11", text)
     text = re.sub(r"٠\s*٤", "40", text)
+    # إصلاح الأرقام المختلطة بحروف لاتينية: 4lO -> 410، 94O -> 940 ...
+    text = " ".join(_normalize_digit_token(tok) for tok in text.split())
     return text
 
 
@@ -682,6 +718,18 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
             )
     if len(rows) < 3:
         return None
+
+    # أعمدة رقمية: صحّح فيها الرموز المفردة التي قرأها OCR حروفًا (l -> 1، O -> 0)
+    data_start = 2 if is_real_sub_header else 1
+    if len(rows) > data_start:
+        for c in range(len(rows[0])):
+            values = [rows[r][c] for r in range(data_start, len(rows)) if rows[r][c].strip()]
+            if not values:
+                continue
+            numeric = sum(1 for value in values if _is_numeric_like(value))
+            if numeric >= max(2, int(len(values) * 0.6)):
+                for r in range(data_start, len(rows)):
+                    rows[r][c] = _normalize_numeric_text(rows[r][c])
 
     # إصلاح ترقيم التسلسل المفقود في الخلية الأولى (الرقم 1)
     if len(rows) > 2:
