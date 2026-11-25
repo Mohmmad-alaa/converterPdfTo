@@ -66,6 +66,7 @@ class OcrPage:
     height: int = 0
     v_lines: list[int] = field(default_factory=list)
     h_lines: list[int] = field(default_factory=list)
+    image: Image.Image | None = field(default=None, repr=False, compare=False)
 
     @property
     def text(self) -> str:
@@ -110,6 +111,21 @@ def _engine():
         engine = OcrEngine.try_create_from_user_profile_languages()
 
     _thread_local.engine = engine
+    return engine
+
+
+def _english_engine():
+    """محرّك إنجليزي منفصل لقراءة الأرقام داخل خلايا الجداول بدقة أعلى."""
+    engine = getattr(_thread_local, "english_engine", None)
+    if engine is not None:
+        return engine
+    try:
+        from winrt.windows.globalization import Language
+        from winrt.windows.media.ocr import OcrEngine
+        engine = OcrEngine.try_create_from_language(Language("en-US"))
+    except Exception:
+        engine = None
+    _thread_local.english_engine = engine
     return engine
 
 
@@ -225,7 +241,7 @@ def ocr_image(img: Image.Image) -> OcrPage:
     )
 
     result = engine.recognize_async(bitmap).get()
-    page = OcrPage(width=rgba.width, height=rgba.height)
+    page = OcrPage(width=rgba.width, height=rgba.height, image=img.convert("RGB"))
     page.v_lines, page.h_lines = detect_grid_lines(rgba)
 
     for raw_line in list(result.lines):
@@ -460,6 +476,39 @@ def _normalize_numeric_text(text: str) -> str:
 def _is_numeric_like(text: str) -> bool:
     text = text.strip()
     return bool(text) and bool(_NUMERIC_TOKEN_RE.fullmatch(text))
+
+
+def _ocr_numeric_strip(img: Image.Image) -> list[tuple[float, str]]:
+    """يقرأ عمودًا رقميًا كاملًا بمحرّك إنجليزي مكبّر، ويعيد (y, النص) لكل سطر."""
+    engine = _english_engine()
+    if engine is None or img.width < 8 or img.height < 8:
+        return []
+    try:
+        from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
+        from winrt.windows.security.cryptography import CryptographicBuffer
+
+        scale = 3
+        big = img.resize((img.width * scale, img.height * scale), Image.LANCZOS).convert("RGBA")
+        r, g, b, a = big.split()
+        bgra = Image.merge("RGBA", (b, g, r, a)).tobytes()
+        buffer = CryptographicBuffer.create_from_byte_array(bgra)
+        bitmap = SoftwareBitmap.create_copy_from_buffer(
+            buffer, BitmapPixelFormat.BGRA8, big.width, big.height, BitmapAlphaMode.PREMULTIPLIED
+        )
+        result = engine.recognize_async(bitmap).get()
+        out: list[tuple[float, str]] = []
+        for line in list(result.lines):
+            text = _normalize_numeric_text(line.text.strip())
+            if not _is_numeric_like(text):
+                continue
+            words = list(line.words)
+            if not words:
+                continue
+            cy = sum(w.bounding_rect.y + w.bounding_rect.height / 2 for w in words) / len(words)
+            out.append((cy / scale, text))
+        return out
+    except Exception:
+        return []
 
 
 def clean_arabic_ocr(text: str) -> str:
@@ -723,6 +772,7 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
     data_start = 2 if is_real_sub_header else 1
     if len(rows) > data_start:
         for c in range(len(rows[0])):
+            group = groups[c]
             values = [rows[r][c] for r in range(data_start, len(rows)) if rows[r][c].strip()]
             if not values:
                 continue
@@ -730,6 +780,42 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
             if numeric >= max(2, int(len(values) * 0.6)):
                 for r in range(data_start, len(rows)):
                     rows[r][c] = _normalize_numeric_text(rows[r][c])
+
+                # إعادة قراءة العمود الرقمي كاملًا بمحرّك إنجليزي مكبّر:
+                # أسرع من قراءة كل خلية على حدة، وأدق للأرقام الصغيرة/المقطوعة.
+                header_text = rows[0][c] + (" " + rows[1][c] if is_real_sub_header and len(rows) > 1 else "")
+                if page.image is not None and any(k in header_text for k in ("مساح", "قيم")):
+                    x0 = int(col_bands[group[0]][0]) + 3
+                    x1 = int(col_bands[group[-1]][1]) - 3
+                    y0 = int(row_bands[row_indices[data_start]][0]) + 3
+                    y1 = int(row_bands[row_indices[-1]][1]) - 3
+                    if x1 - x0 >= 8 and y1 - y0 >= 8:
+                        strip = page.image.crop(
+                            (max(0, x0), max(0, y0), min(page.width, x1), min(page.height, y1))
+                        )
+                        for rel_y, fresh in _ocr_numeric_strip(strip):
+                            abs_y = y0 + rel_y
+                            target = next(
+                                (
+                                    r
+                                    for r in range(data_start, len(rows))
+                                    if row_bands[row_indices[r]][0] <= abs_y <= row_bands[row_indices[r]][1]
+                                ),
+                                None,
+                            )
+                            if target is None:
+                                continue
+                            cell = rows[target][c].strip()
+                            if cell and not re.search(r"\d\s+\d", cell):
+                                continue
+                            # الخلايا الفارغة في صفوف الورثة غالبًا فارغة فعلاً؛
+                            # نعيد القراءة فقط إذا كان الصف يحمل أرقامًا أخرى كافية.
+                            if not cell and sum(1 for v in rows[target] if _is_numeric_like(v)) < 3:
+                                continue
+                            old_digits = sum(ch.isdigit() for ch in cell)
+                            new_digits = sum(ch.isdigit() for ch in fresh)
+                            if new_digits > old_digits:
+                                rows[target][c] = fresh
 
     # إصلاح ترقيم التسلسل المفقود في الخلية الأولى (الرقم 1)
     if len(rows) > 2:
