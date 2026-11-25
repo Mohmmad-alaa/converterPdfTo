@@ -74,7 +74,7 @@
     toastEl.classList.toggle("err", isError);
     toastEl.classList.add("show");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toastEl.classList.remove("show"), 3600);
+    toastTimer = setTimeout(() => toastEl.classList.remove("show"), isError ? 8000 : 3600);
   }
 
   const totalBytes = () => state.files.reduce((sum, f) => sum + f.size, 0);
@@ -208,15 +208,32 @@
         const data = JSON.parse(text);
         if (data && data.detail) message = data.detail;
       } catch { /* تجاهل */ }
+      showError(message);
       toast(message, true);
     };
 
     xhr.onerror = () => {
       setBusy(false);
-      toast("انقطع الاتصال بالخدمة — تأكد أن التطبيق يعمل.", true);
+      const message = "انقطع الاتصال بالخدمة — تأكد أن التطبيق يعمل.";
+      showError(message);
+      toast(message, true);
     };
 
     xhr.send(form);
+  }
+
+  function showError(message) {
+    results.hidden = false;
+    const li = document.createElement("li");
+    li.className = "res-item error";
+    li.innerHTML = `
+      <span class="f-badge err">!</span>
+      <span class="f-meta">
+        <span class="f-name"></span>
+        <span class="f-size">لم يتم إنشاء ملف — راجع السبب وحاول مرة أخرى</span>
+      </span>`;
+    li.querySelector(".f-name").textContent = message || "تعذّر إكمال التحويل.";
+    resultList.prepend(li);
   }
 
   function showResult(blob, name) {

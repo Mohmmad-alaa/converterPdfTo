@@ -278,6 +278,9 @@ html[data-theme="dark"] .ico-moon { display: block; }
 .res-item .f-badge.xlsx { background: linear-gradient(145deg, #28a15f, #1d7044); }
 .res-item .f-badge.pptx { background: linear-gradient(145deg, #e06a35, #c2410c); }
 .res-item .f-badge.zip { background: linear-gradient(145deg, #8b5cf6, #6d28d9); }
+.res-item.error { border-color: rgba(239, 68, 68, 0.35); background: rgba(239, 68, 68, 0.08); }
+.res-item.error .f-badge { background: linear-gradient(145deg, #ef4444, #b91c1c); }
+.res-item.error .f-name { color: #b91c1c; font-weight: 800; }
 .dl-btn {
   flex: none; height: 38px; padding: 0 16px; border-radius: 11px; cursor: pointer;
   display: inline-flex; align-items: center; gap: 7px; text-decoration: none;

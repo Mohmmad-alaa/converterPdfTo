@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -23,6 +24,11 @@ import ocr_engine
 from ocr_engine import Grid, PageLayout
 
 logger = logging.getLogger("muhawwil.ai")
+
+
+class AiEngineError(RuntimeError):
+    """خطأ من محرك Gemini يمكن عرضه مباشرةً للمستخدم."""
+
 
 GEMINI_MODELS = [
     "gemini-2.0-flash",
@@ -86,6 +92,24 @@ def is_available(custom_key: str | None = None) -> bool:
     return bool(get_api_key(custom_key))
 
 
+def _parse_gemini_json(raw_text: str) -> dict[str, Any]:
+    """يتحمل استجابة JSON خام أو ملفوفة داخل Markdown code fence."""
+    text = (raw_text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        data = json.loads(text[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("استجابة Gemini ليست كائن JSON صالحًا.")
+    return data
+
+
 def _call_gemini_vision(img_bytes: bytes, api_key: str) -> dict[str, Any]:
     """يطلب تحليل الصورة من Gemini API ويسترجع كائن JSON المهيكل."""
     b64_data = base64.b64encode(img_bytes).decode("utf-8")
@@ -134,16 +158,22 @@ def _call_gemini_vision(img_bytes: bytes, api_key: str) -> dict[str, Any]:
                 if not content_parts:
                     continue
                 raw_text = content_parts[0].get("text", "").strip()
-                return json.loads(raw_text)
+                return _parse_gemini_json(raw_text)
         except urllib.error.HTTPError as err:
             err_msg = err.read().decode("utf-8", errors="ignore")
             logger.warning("Gemini error (%s) on model %s: %s", err.code, model, err_msg)
-            last_err = RuntimeError(f"خطأ في خادم Gemini ({err.code}): {err.reason}")
+            if err.code in (400, 401, 403) and ("api key" in err_msg.lower() or "api_key" in err_msg.lower()):
+                raise AiEngineError("مفتاح Gemini API غير صالح. تحقق من المفتاح أو أنشئ مفتاحًا جديدًا.")
+            if err.code == 429:
+                raise AiEngineError("تم تجاوز حد استخدام Gemini المجاني. حاول لاحقًا.")
+            last_err = AiEngineError(f"خطأ من خدمة Gemini ({err.code}). حاول لاحقًا.")
+        except AiEngineError:
+            raise
         except Exception as exc:
             logger.warning("Gemini request failed on model %s: %s", model, exc)
-            last_err = exc
+            last_err = AiEngineError(f"تعذّر الاتصال بخدمة الذكاء الاصطناعي: {exc}")
 
-    raise last_err or RuntimeError("تعذّر الاتصال بخدمة الذكاء الاصطناعي.")
+    raise last_err or AiEngineError("تعذّر الاتصال بخدمة الذكاء الاصطناعي.")
 
 
 def analyze_page_ai(img: Image.Image, api_key: str | None = None) -> PageLayout:

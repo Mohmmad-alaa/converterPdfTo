@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
+import ai_engine
 import converters
 
 BASE = Path(__file__).resolve().parent
@@ -158,6 +159,8 @@ async def convert(
             raise
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        except ai_engine.AiEngineError as exc:
+            raise HTTPException(502, str(exc))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 500, f"تعذّر إكمال التحويل ({type(exc).__name__}). تأكد أن الملف سليم وغير محمي بكلمة مرور."
