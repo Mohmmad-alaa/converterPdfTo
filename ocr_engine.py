@@ -854,9 +854,12 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                     rows[r][c] = _normalize_numeric_text(rows[r][c])
 
                 # احتياط أول: طبقة نص PDF قد تحمل الرقم الصحيح رغم تشوّه العربي.
+                # قد يكون الرقم مقطوعًا إلى كلمتين (1 + 1936) بسبب الختم، لذا نجمع
+                # كلمات الخلية المتقاربة قبل المقارنة.
                 if page.native_words:
                     nx0 = col_bands[group[0]][0]
                     nx1 = col_bands[group[-1]][1]
+                    by_row: dict[int, list[Word]] = {}
                     for nw in page.native_words:
                         if not (nx0 <= nw.cx <= nx1):
                             continue
@@ -868,14 +871,19 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                             ),
                             None,
                         )
-                        if target is None:
+                        if target is not None:
+                            by_row.setdefault(target, []).append(nw)
+
+                    for target, words in by_row.items():
+                        words.sort(key=lambda w: w.x0)
+                        combined = words[0].text
+                        for prev, nw in zip(words, words[1:]):
+                            gap = nw.x0 - prev.x1
+                            combined += ("" if gap <= 24 else " ") + nw.text
+                        fresh = _normalize_numeric_text(combined)
+                        if " " in fresh or not _is_numeric_like(fresh):
                             continue
                         cell = rows[target][c].strip()
-                        if cell and not re.search(r"\d\s+\d", cell):
-                            continue
-                        fresh = _normalize_numeric_text(nw.text)
-                        if not _is_numeric_like(fresh):
-                            continue
                         old_digits = sum(ch.isdigit() for ch in cell)
                         new_digits = sum(ch.isdigit() for ch in fresh)
                         if new_digits > old_digits:
