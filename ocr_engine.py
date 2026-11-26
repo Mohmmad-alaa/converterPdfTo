@@ -513,6 +513,46 @@ def _is_numeric_like(text: str) -> bool:
     return bool(text) and bool(_NUMERIC_TOKEN_RE.fullmatch(text))
 
 
+def _blue_fraction(img: Image.Image) -> float:
+    """نسبة الحبر الأزرق (الختم) داخل خلية — لتحديد الخلايا التي تحتاج قراءة بالأحمر."""
+    try:
+        import cv2
+        import numpy as np
+
+        hsv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2HSV)
+        mask = (hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 145) & (hsv[:, :, 1] > 60)
+        return float(mask.mean())
+    except Exception:
+        return 0.0
+
+
+def _ocr_numeric_cell_blue(img: Image.Image) -> str:
+    """يقرأ خلية تحت ختم أزرق باستخدام القناة الزرقاء (الختم يصبح فاتحًا)."""
+    engine = _english_engine()
+    if engine is None or img.width < 8 or img.height < 8:
+        return ""
+    try:
+        import numpy as np
+        from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
+        from winrt.windows.security.cryptography import CryptographicBuffer
+
+        arr = np.array(img.convert("RGB"))
+        blue = Image.fromarray(arr[:, :, 2])
+        scale = 3
+        big = blue.resize((blue.width * scale, blue.height * scale), Image.LANCZOS).convert("RGBA")
+        r, g, b, a = big.split()
+        bgra = Image.merge("RGBA", (b, g, r, a)).tobytes()
+        buffer = CryptographicBuffer.create_from_byte_array(bgra)
+        bitmap = SoftwareBitmap.create_copy_from_buffer(
+            buffer, BitmapPixelFormat.BGRA8, big.width, big.height, BitmapAlphaMode.PREMULTIPLIED
+        )
+        result = engine.recognize_async(bitmap).get()
+        raw = " ".join(line.text.strip() for line in list(result.lines) if line.text.strip())
+        return _normalize_numeric_text(raw)
+    except Exception:
+        return ""
+
+
 def _ocr_row_numeric_words(img: Image.Image) -> list[tuple[float, float, str]]:
     """يقرأ صفًا كاملًا بمحرّك إنجليزي ويعيد (cx, cy, النص) للأرقام فقط."""
     engine = _english_engine()
@@ -919,6 +959,44 @@ def _analyze_with_lines(page: OcrPage) -> PageLayout | None:
                             new_digits = sum(ch.isdigit() for ch in fresh)
                             if new_digits > old_digits:
                                 rows[target][c] = fresh
+
+                # خلايا يغطيها ختم أزرق: نعيد قراءتها بالقناة الزرقاء وحدها،
+                # لأن الحبر الأزرق يصبح فاتحًا بينما تبقى الأرقام السوداء واضحة.
+                if page.image is not None:
+                    tx0 = int(col_bands[group[0]][0]) + 3
+                    tx1 = int(col_bands[group[-1]][1]) - 3
+                    for r in range(data_start, len(rows)):
+                        cell = rows[r][c].strip()
+                        junk = bool(re.search(r"[^\d\s.,:/\-+%()]|[,/]{2,}|[,/]$", cell))
+                        if not cell and not junk:
+                            continue
+                        ty0 = int(row_bands[row_indices[r]][0]) + 2
+                        ty1 = int(row_bands[row_indices[r]][1]) - 2
+                        if tx1 - tx0 < 8 or ty1 - ty0 < 8:
+                            continue
+                        tight = page.image.crop(
+                            (max(0, tx0), max(0, ty0), min(page.width, tx1), min(page.height, ty1))
+                        )
+                        if not junk and _blue_fraction(tight) < 0.07:
+                            continue
+                        old_digits = sum(ch.isdigit() for ch in cell)
+                        fresh = _ocr_numeric_cell_blue(tight)
+                        if not _is_numeric_like(fresh) or sum(ch.isdigit() for ch in fresh) < old_digits:
+                            # بعض الأرقام تمتد خارج حدود الخلية قليلًا؛ نوسّع ثم نعيد المحاولة
+                            wide = page.image.crop(
+                                (
+                                    max(0, tx0 - 13),
+                                    max(0, ty0 - 7),
+                                    min(page.width, tx1 + 13),
+                                    min(page.height, ty1 + 7),
+                                )
+                            )
+                            fresh = _ocr_numeric_cell_blue(wide)
+                        if not _is_numeric_like(fresh):
+                            continue
+                        new_digits = sum(ch.isdigit() for ch in fresh)
+                        if new_digits >= old_digits and new_digits > 0:
+                            rows[r][c] = fresh
 
     # أرقام القطع المفردة: OCR يتجاهلها أحيانًا إذا قرأ الخلية وحدها،
     # فنقرأ الصف كاملًا (سياق حقيقي) ونأخذ الرقم الواقع داخل عمود القطعة فقط.
